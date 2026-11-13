@@ -1,0 +1,3731 @@
+﻿===== index.html identical to index.html.bak.1794584383: True =====
+===== FILE: main.go =====
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/csv"
+	"encoding/hex"
+	"encoding/json"
+	"image"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
+	"io"
+	"log"
+	mrand "math/rand"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+type UserInfo struct {
+	Name string `json:"name"`
+	Role string `json:"role"`
+}
+
+type InvItem struct {
+	ID          string  `json:"id"`
+	Room        string  `json:"room,omitempty"`
+	Title       string  `json:"title"`
+	Price       float64 `json:"price"`
+	Quantity    int     `json:"quantity"`
+	Condition   string  `json:"condition"`
+	Description string  `json:"description"`
+	Owner       string  `json:"owner,omitempty"`
+}
+
+type Msg struct {
+	ID         int      `json:"id"`
+	Room       string   `json:"room,omitempty"`
+	From       string   `json:"from"`
+	Role       string   `json:"role,omitempty"`
+	Text       string   `json:"text"`
+	MediaURL   string   `json:"media_url,omitempty"`
+	MediaType  string   `json:"media_type,omitempty"`
+	STT        bool     `json:"stt,omitempty"`
+	PinnedItem *InvItem `json:"pinned_item,omitempty"`
+	Edited     bool     `json:"edited,omitempty"`
+	Deleted    bool     `json:"deleted,omitempty"`
+	At         string   `json:"at"`
+}
+
+type VideoState struct {
+	URL       string  `json:"url"`
+	Playing   bool    `json:"playing"`
+	Position  float64 `json:"position"`
+	UpdatedAt int64   `json:"updated_at"`
+}
+
+type GiveawayState struct {
+	Active  bool     `json:"active"`
+	Title   string   `json:"title"`
+	Entries []string `json:"entries"`
+	Winner  string   `json:"winner"`
+}
+
+type AuctionState struct {
+Active     bool    `json:"active"`
+ItemTitle  string  `json:"item_title"`
+StartPrice float64 `json:"start_price"`
+HighBid    float64 `json:"high_bid"`
+HighBidder string  `json:"high_bidder"`
+}
+
+type RoomState struct {
+	ID            string          `json:"id"`
+	Title         string          `json:"title"`
+	Owner         string          `json:"owner"`
+	StoreName     string          `json:"store_name,omitempty"`
+	StoreURL      string          `json:"store_url,omitempty"`
+	AudioMode     string          `json:"audio_mode"` // "stt_only" or "live"
+	Video         VideoState      `json:"video"`
+	Giveaway      GiveawayState   `json:"giveaway"`
+	Auction       AuctionState    `json:"auction"`
+	Followers     map[string]bool `json:"-"`
+	FollowerCount int             `json:"follower_count"`
+	FollowedByMe  bool            `json:"followed_by_me,omitempty"`
+	Online        []string        `json:"online,omitempty"`
+}
+
+type wsClient struct {
+	conn *websocket.Conn
+	user UserInfo
+	room string
+	send chan []byte
+}
+
+var (
+	mu         sync.Mutex
+	msgs       []Msg
+	lastID     int
+	keys       = map[string]UserInfo{}
+	store      *os.File
+	rooms      = map[string]*RoomState{}
+	customInv  = []InvItem{}
+	clients    = map[*wsClient]bool{}
+	mediaDir   = "/var/lib/mf-chat/media"
+	roomsFile  = "/var/lib/mf-chat/rooms.json"
+	invFile    = "/var/lib/mf-chat/inventory.json"
+	msgsFile   = "/var/lib/mf-chat/messages.json"
+	catalogCSV = "/opt/mf-go/catalog.csv"
+	upgrader   = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+)
+
+func loadKeys(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Split(line, ":")
+		if len(parts) >= 2 && len(parts[1]) >= 32 {
+			name := parts[0]
+			key := parts[1]
+			role := "seller"
+			if name == "sean" {
+				role = "admin"
+			}
+			if len(parts) >= 3 && (parts[2] == "admin" || parts[2] == "seller" || parts[2] == "guest") {
+				role = parts[2]
+			}
+			keys[key] = UserInfo{Name: name, Role: role}
+		}
+	}
+	if len(keys) == 0 {
+		log.Fatal("no valid keys in ", path)
+	}
+}
+
+func who(r *http.Request) (UserInfo, bool) {
+	k := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if k == "" {
+		k = r.URL.Query().Get("token")
+	}
+	for key, u := range keys {
+		if subtle.ConstantTimeCompare([]byte(k), []byte(key)) == 1 {
+			return u, true
+		}
+	}
+	return UserInfo{}, false
+}
+
+func initRooms() {
+	if b, err := os.ReadFile(roomsFile); err == nil {
+		_ = json.Unmarshal(b, &rooms)
+	}
+	defaults := []struct {
+		id, title, owner string
+	}{
+		{"main", "#main-comms", "sean"},
+		{"boystown", "BoysTown Live", "sean"},
+		{"ops", "#pipeline-ops", "sean"},
+	}
+	for _, d := range defaults {
+		if _, ok := rooms[d.id]; !ok {
+			rooms[d.id] = &RoomState{
+				ID:        d.id,
+				Title:     d.title,
+				Owner:     d.owner,
+				AudioMode: "stt_only",
+				Followers: map[string]bool{},
+			}
+		}
+	}
+	for _, rm := range rooms {
+		if rm.Followers == nil {
+			rm.Followers = map[string]bool{}
+		}
+		if rm.AudioMode == "" {
+			rm.AudioMode = "stt_only"
+		}
+		rm.FollowerCount = len(rm.Followers)
+	}
+	if b, err := os.ReadFile(invFile); err == nil {
+		_ = json.Unmarshal(b, &customInv)
+	}
+}
+
+func saveRoomsLocked() {
+	b, _ := json.MarshalIndent(rooms, "", "  ")
+	_ = os.WriteFile(roomsFile, b, 0600)
+}
+
+func getOrCreateRoomLocked(id, owner string) *RoomState {
+	if id == "" {
+		id = "main"
+	}
+	if rm, ok := rooms[id]; ok {
+		return rm
+	}
+	title := id
+	if strings.HasPrefix(id, "seller:") {
+		title = "Seller // " + strings.TrimPrefix(id, "seller:")
+	}
+	rm := &RoomState{
+		ID:        id,
+		Title:     title,
+		Owner:     owner,
+		AudioMode: "stt_only",
+		Followers: map[string]bool{},
+	}
+	rooms[id] = rm
+	saveRoomsLocked()
+	return rm
+}
+
+func canHostRoom(u UserInfo, rm *RoomState) bool {
+	return u.Role == "admin" || (rm != nil && rm.Owner == u.Name)
+}
+
+func roomSnapshotLocked(rm *RoomState, viewer string) RoomState {
+	cp := *rm
+	cp.FollowerCount = len(rm.Followers)
+	cp.FollowedByMe = rm.Followers[viewer]
+	seen := map[string]bool{}
+	online := []string{}
+	for c := range clients {
+		if c.room == rm.ID && !seen[c.user.Name] {
+			seen[c.user.Name] = true
+			online = append(online, c.user.Name)
+		}
+	}
+	cp.Online = online
+	return cp
+}
+
+func broadcastRoomLocked(roomID string, eventType string, payload any) {
+	env := map[string]any{"type": eventType, "room": roomID, "data": payload}
+	b, _ := json.Marshal(env)
+	for c := range clients {
+		if c.room == roomID {
+			select {
+			case c.send <- b:
+			default:
+			}
+		}
+	}
+}
+
+func broadcastRoomStateLocked(rm *RoomState) {
+	for c := range clients {
+		if c.room == rm.ID {
+			snap := roomSnapshotLocked(rm, c.user.Name)
+			env := map[string]any{"type": "room_state", "room": rm.ID, "data": snap}
+			b, _ := json.Marshal(env)
+			select {
+			case c.send <- b:
+			default:
+			}
+		}
+	}
+}
+
+func apiMe(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(u)
+}
+
+
+func saveAllMsgsLocked() {
+if store == nil {
+return
+}
+f, err := os.Create(msgsFile)
+if err != nil {
+return
+}
+for _, m := range msgs {
+b, _ := json.Marshal(m)
+f.Write(b)
+f.Write([]byte("\n"))
+}
+f.Close()
+}
+
+func handleAiMentionsLocked(roomID string, userMsg *Msg) {
+    text := strings.ToLower(userMsg.Text)
+    bots := map[string]struct{ name, role, reply string }{
+        "@mate":     {"@mate", "Co-Pilot", "Acknowledged. MateFlow operational stream active for room: " + roomID + "."},
+        "@curator":  {"@curator", "Vault Curator", "Inventory index parsed. Target items cataloged and verified."},
+        "@trader":   {"@trader", "Market Analyst", "Liquidity check and pricing spread evaluated for the requested asset."},
+        "@sentinel": {"@sentinel", "Security Sentinel", "Integrity confirmed. Zero anomalous state transitions detected."},
+        "@oracle":   {"@oracle", "Predictive Oracle", "Trajectory analysis indicates 94.2% positive alignment."},
+    }
+
+    for tag, bot := range bots {
+        if strings.Contains(text, tag) {
+            aiMsg := Msg{
+                ID:        int(time.Now().UnixNano()),
+                Room:      roomID,
+                From:      bot.name,
+                Role:      "bot",
+                Text:      bot.reply,
+                At:        time.Now().Format("15:04:05"),
+            }
+            msgs = append(msgs, aiMsg)
+            saveAllMsgsLocked()
+            broadcastRoomLocked(roomID, "chat", aiMsg)
+            break
+        }
+    }
+}
+func apiMessages(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	switch r.Method {
+case "PUT":
+var req struct {
+ID      int64  `json:"id"`
+Content string `json:"content"`
+}
+if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+http.Error(w, "bad request", 400)
+return
+}
+mu.Lock()
+var updated *Msg
+for i := range msgs {
+if msgs[i].ID == int(req.ID) {
+if msgs[i].From != u.Name && u.Role != "admin" {
+mu.Unlock()
+http.Error(w, "forbidden", 403)
+return
+}
+msgs[i].Text = req.Content
+msgs[i].Edited = true
+updated = &msgs[i]
+break
+}
+}
+if updated != nil {
+saveAllMsgsLocked()
+broadcastRoomLocked(updated.Room, "msg_edit", updated)
+}
+mu.Unlock()
+if updated == nil {
+http.Error(w, "not found", 404)
+return
+}
+json.NewEncoder(w).Encode(updated)
+return
+
+case "DELETE":
+idStr := r.URL.Query().Get("id")
+id, _ := strconv.ParseInt(idStr, 10, 64)
+mu.Lock()
+var deleted *Msg
+for i := range msgs {
+if msgs[i].ID == int(id) {
+if msgs[i].From != u.Name && u.Role != "admin" {
+mu.Unlock()
+http.Error(w, "forbidden", 403)
+return
+}
+msgs[i].Deleted = true
+msgs[i].Text = "This message was deleted"
+deleted = &msgs[i]
+break
+}
+}
+if deleted != nil {
+saveAllMsgsLocked()
+broadcastRoomLocked(deleted.Room, "msg_delete", map[string]any{"id": deleted.ID, "room": deleted.Room})
+}
+mu.Unlock()
+if deleted == nil {
+http.Error(w, "not found", 404)
+return
+}
+w.WriteHeader(204)
+return
+
+case "GET":
+		since, _ := strconv.Atoi(r.URL.Query().Get("since"))
+		room := r.URL.Query().Get("room")
+		if room == "" {
+			room = "main"
+		}
+		mu.Lock()
+		out := []Msg{}
+		for _, m := range msgs {
+			mRoom := m.Room
+			if mRoom == "" {
+				mRoom = "main"
+			}
+			if m.ID > since && (room == "all" || mRoom == room) {
+				out = append(out, m)
+			}
+		}
+		mu.Unlock()
+		json.NewEncoder(w).Encode(out)
+	case "POST":
+		var in struct {
+			Room       string   `json:"room"`
+			Text       string   `json:"text"`
+			MediaURL   string   `json:"media_url"`
+			MediaType  string   `json:"media_type"`
+			STT        bool     `json:"stt"`
+			PinnedItem *InvItem `json:"pinned_item"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&in); err != nil {
+			http.Error(w, "bad request", 400)
+			return
+		}
+		if strings.TrimSpace(in.Text) == "" && in.MediaURL == "" && in.PinnedItem == nil {
+			http.Error(w, "bad request: empty message", 400)
+			return
+		}
+		if in.Room == "" {
+			in.Room = "main"
+		}
+		mu.Lock()
+		getOrCreateRoomLocked(in.Room, u.Name)
+		m := Msg{
+			ID:         lastID + 1,
+			Room:       in.Room,
+			From:       u.Name,
+			Role:       u.Role,
+			Text:       in.Text,
+			MediaURL:   in.MediaURL,
+			MediaType:  in.MediaType,
+			STT:        in.STT,
+			PinnedItem: in.PinnedItem,
+			At:         time.Now().UTC().Format(time.RFC3339),
+		}
+		b, _ := json.Marshal(m)
+		if _, err := store.Write(append(b, '\n')); err != nil {
+			mu.Unlock()
+			http.Error(w, "store failed", 500)
+			return
+		}
+		msgs = append(msgs, m)
+		lastID = m.ID
+		broadcastRoomLocked(in.Room, "chat", m)
+		mu.Unlock()
+		json.NewEncoder(w).Encode(m)
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+func apiRooms(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == "GET" {
+		mu.Lock()
+		out := []RoomState{}
+		for _, rm := range rooms {
+			out = append(out, roomSnapshotLocked(rm, u.Name))
+		}
+		mu.Unlock()
+		json.NewEncoder(w).Encode(out)
+		return
+	}
+	if r.Method == "POST" {
+		var in struct {
+			ID    string `json:"id"`
+			Title string `json:"title"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&in); err != nil || strings.TrimSpace(in.ID) == "" {
+			http.Error(w, "bad request", 400)
+			return
+		}
+		id := strings.ToLower(strings.TrimSpace(in.ID))
+		if u.Role != "admin" && id != "seller:"+u.Name {
+			http.Error(w, "forbidden: sellers can only create their own seller room", 403)
+			return
+		}
+		mu.Lock()
+		rm := getOrCreateRoomLocked(id, u.Name)
+		if in.Title != "" {
+			rm.Title = in.Title
+			saveRoomsLocked()
+		}
+		snap := roomSnapshotLocked(rm, u.Name)
+		mu.Unlock()
+		json.NewEncoder(w).Encode(snap)
+		return
+	}
+if r.Method == "PATCH" || r.Method == "PUT" {
+var in struct {
+ID   int    `json:"id"`
+Text string `json:"text"`
+}
+if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil {
+http.Error(w, "bad request", 400)
+return
+}
+mu.Lock()
+for i := range msgs {
+if msgs[i].ID == in.ID && !msgs[i].Deleted {
+rm := rooms[msgs[i].Room]
+if msgs[i].From != u.Name && !canHostRoom(u, rm) {
+mu.Unlock()
+http.Error(w, "forbidden", 403)
+return
+}
+msgs[i].Text = in.Text
+msgs[i].Edited = true
+updated := msgs[i]
+saveAllMsgsLocked()
+broadcastRoomLocked(updated.Room, "msg_edit", updated)
+mu.Unlock()
+w.Header().Set("Content-Type", "application/json")
+json.NewEncoder(w).Encode(updated)
+return
+}
+}
+mu.Unlock()
+http.Error(w, "not found", 404)
+return
+}
+if r.Method == "DELETE" {
+idStr := r.URL.Query().Get("id")
+id, _ := strconv.Atoi(idStr)
+mu.Lock()
+for i := range msgs {
+if msgs[i].ID == int(id) {
+rm := rooms[msgs[i].Room]
+if msgs[i].From != u.Name && !canHostRoom(u, rm) {
+mu.Unlock()
+http.Error(w, "forbidden", 403)
+return
+}
+msgs[i].Deleted = true
+msgs[i].Text = "[message recalled]"
+msgs[i].MediaURL = ""
+msgs[i].PinnedItem = nil
+targetRoom := msgs[i].Room
+saveAllMsgsLocked()
+broadcastRoomLocked(targetRoom, "msg_delete", map[string]any{"id": id})
+mu.Unlock()
+w.Header().Set("Content-Type", "application/json")
+json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id})
+return
+}
+}
+mu.Unlock()
+http.Error(w, "not found", 404)
+return
+}
+http.Error(w, "method not allowed", 405)
+}
+
+func apiRoomState(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	roomID := r.URL.Query().Get("room")
+	if roomID == "" {
+		roomID = "main"
+	}
+	mu.Lock()
+	rm := getOrCreateRoomLocked(roomID, u.Name)
+	snap := roomSnapshotLocked(rm, u.Name)
+	mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snap)
+}
+
+func apiRoomVideo(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	roomID := r.URL.Query().Get("room")
+	var in struct {
+		Action   string  `json:"action"` // load, play, pause, seek
+		URL      string  `json:"url"`
+		Position float64 `json:"position"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&in); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	mu.Lock()
+	rm := getOrCreateRoomLocked(roomID, u.Name)
+	if !canHostRoom(u, rm) {
+		mu.Unlock()
+		http.Error(w, "forbidden: host only", 403)
+		return
+	}
+	switch in.Action {
+	case "load":
+		rm.Video.URL = strings.TrimSpace(in.URL)
+		rm.Video.Position = 0
+		rm.Video.Playing = false
+	case "play":
+		if in.URL != "" {
+			rm.Video.URL = strings.TrimSpace(in.URL)
+		}
+		rm.Video.Position = in.Position
+		rm.Video.Playing = true
+	case "pause":
+		rm.Video.Position = in.Position
+		rm.Video.Playing = false
+	case "seek":
+		rm.Video.Position = in.Position
+	}
+	rm.Video.UpdatedAt = time.Now().UnixMilli()
+	saveRoomsLocked()
+	broadcastRoomStateLocked(rm)
+	snap := roomSnapshotLocked(rm, u.Name)
+	mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snap)
+}
+
+func apiRoomAudio(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	roomID := r.URL.Query().Get("room")
+	var in struct {
+		AudioMode string `json:"audio_mode"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&in); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	if in.AudioMode != "live" && in.AudioMode != "stt_only" {
+		http.Error(w, "invalid audio_mode", 400)
+		return
+	}
+	mu.Lock()
+	rm := getOrCreateRoomLocked(roomID, u.Name)
+	if !canHostRoom(u, rm) {
+		mu.Unlock()
+		http.Error(w, "forbidden: host only", 403)
+		return
+	}
+	rm.AudioMode = in.AudioMode
+	saveRoomsLocked()
+	broadcastRoomStateLocked(rm)
+	snap := roomSnapshotLocked(rm, u.Name)
+	mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snap)
+}
+
+func safeURL(raw string) string {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return ""
+	}
+	if !strings.Contains(u, "://") && strings.Contains(u, ".") && !strings.ContainsAny(u, " \t\n") {
+		u = "https://" + u
+	}
+	lu := strings.ToLower(u)
+	if strings.HasPrefix(lu, "https://") || strings.HasPrefix(lu, "http://") {
+		return u
+	}
+	return ""
+}
+
+func apiRoomStore(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	roomID := r.URL.Query().Get("room")
+	var in struct {
+		StoreName string `json:"store_name"`
+		StoreURL  string `json:"store_url"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2048)).Decode(&in); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	mu.Lock()
+	rm := getOrCreateRoomLocked(roomID, u.Name)
+	if !canHostRoom(u, rm) {
+		mu.Unlock()
+		http.Error(w, "forbidden: host only", 403)
+		return
+	}
+	rm.StoreName = strings.TrimSpace(in.StoreName)
+	if len(rm.StoreName) > 80 {
+		rm.StoreName = rm.StoreName[:80]
+	}
+	rm.StoreURL = safeURL(in.StoreURL)
+	saveRoomsLocked()
+	broadcastRoomStateLocked(rm)
+	snap := roomSnapshotLocked(rm, u.Name)
+	mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snap)
+}
+
+func apiRoomFollow(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	roomID := r.URL.Query().Get("room")
+	mu.Lock()
+	rm := getOrCreateRoomLocked(roomID, u.Name)
+	rm.Followers[u.Name] = true
+	rm.FollowerCount = len(rm.Followers)
+	if rm.Giveaway.Active {
+		found := false
+		for _, e := range rm.Giveaway.Entries {
+			if e == u.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			rm.Giveaway.Entries = append(rm.Giveaway.Entries, u.Name)
+		}
+	}
+	saveRoomsLocked()
+	broadcastRoomStateLocked(rm)
+	snap := roomSnapshotLocked(rm, u.Name)
+	mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snap)
+}
+
+func apiRoomGiveaway(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	roomID := r.URL.Query().Get("room")
+	var in struct {
+		Action string `json:"action"` // start, draw, stop
+		Title  string `json:"title"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2048)).Decode(&in); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	mu.Lock()
+	rm := getOrCreateRoomLocked(roomID, u.Name)
+	if !canHostRoom(u, rm) {
+		mu.Unlock()
+		http.Error(w, "forbidden: host only", 403)
+		return
+	}
+	switch in.Action {
+	case "start":
+		entries := []string{}
+		for follower := range rm.Followers {
+			entries = append(entries, follower)
+		}
+		title := strings.TrimSpace(in.Title)
+		if title == "" {
+			title = "Live Room Giveaway"
+		}
+		rm.Giveaway = GiveawayState{Active: true, Title: title, Entries: entries, Winner: ""}
+	case "draw":
+		if len(rm.Giveaway.Entries) > 0 {
+			winner := rm.Giveaway.Entries[mrand.Intn(len(rm.Giveaway.Entries))]
+			rm.Giveaway.Winner = winner
+			rm.Giveaway.Active = false
+		}
+	case "stop":
+		rm.Giveaway.Active = false
+	}
+	saveRoomsLocked()
+	broadcastRoomStateLocked(rm)
+	snap := roomSnapshotLocked(rm, u.Name)
+	mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snap)
+}
+
+func apiInventory(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	roomID := r.URL.Query().Get("room")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == "GET" {
+		items := []InvItem{}
+		if f, err := os.Open(catalogCSV); err == nil {
+			cr := csv.NewReader(f)
+			rows, err := cr.ReadAll()
+			f.Close()
+			if err == nil && len(rows) > 1 {
+				for _, row := range rows[1:] {
+					if len(row) >= 7 {
+						price, _ := strconv.ParseFloat(row[2], 64)
+						qty, _ := strconv.Atoi(row[3])
+						items = append(items, InvItem{
+							ID:          row[0],
+							Room:        "all",
+							Title:       row[1],
+							Price:       price,
+							Quantity:    qty,
+							Condition:   row[4],
+							Description: row[6],
+						})
+					}
+				}
+			}
+		}
+		mu.Lock()
+		for _, it := range customInv {
+			if roomID == "" || it.Room == "" || it.Room == roomID || it.Room == "all" {
+				items = append(items, it)
+			}
+		}
+		mu.Unlock()
+		json.NewEncoder(w).Encode(items)
+		return
+	}
+	if r.Method == "POST" {
+		var in InvItem
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in); err != nil || strings.TrimSpace(in.Title) == "" {
+			http.Error(w, "bad request", 400)
+			return
+		}
+		if in.Room == "" {
+			in.Room = roomID
+		}
+		if in.ID == "" {
+			buf := make([]byte, 4)
+			rand.Read(buf)
+			in.ID = "MF-" + strings.ToUpper(hex.EncodeToString(buf))
+		}
+		in.Owner = u.Name
+		mu.Lock()
+		customInv = append(customInv, in)
+		b, _ := json.MarshalIndent(customInv, "", "  ")
+		_ = os.WriteFile(invFile, b, 0600)
+		mu.Unlock()
+		json.NewEncoder(w).Encode(in)
+		return
+	}
+	http.Error(w, "method not allowed", 405)
+}
+
+func scanFile(path string) (bool, string) {
+	if _, err := exec.LookPath("clamdscan"); err == nil {
+		cmd := exec.Command("clamdscan", "--no-summary", "--fdpass", path)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return true, "clamd-clean"
+		}
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return false, string(out)
+		}
+	}
+	if _, err := exec.LookPath("clamscan"); err == nil {
+		cmd := exec.Command("clamscan", "--no-summary", path)
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			return true, "clamscan-clean"
+		}
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return false, string(out)
+		}
+	}
+	return true, "reencode-only"
+}
+
+func apiUpload(w http.ResponseWriter, r *http.Request) {
+	if _, ok := who(r); !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, "file too large (max 10MB)", 400)
+		return
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "missing file field", 400)
+		return
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, 9<<20))
+	if err != nil || len(raw) == 0 {
+		http.Error(w, "invalid file", 400)
+		return
+	}
+
+	mime := http.DetectContentType(raw)
+	var ext string
+	switch mime {
+	case "image/jpeg":
+		ext = ".jpg"
+	case "image/png":
+		ext = ".png"
+	case "image/gif":
+		ext = ".gif"
+	default:
+		http.Error(w, "only JPEG, PNG, and GIF allowed", 415)
+		return
+	}
+
+	tmp, err := os.CreateTemp("", "mfupload-*"+ext)
+	if err != nil {
+		http.Error(w, "temp error", 500)
+		return
+	}
+	tmpPath := tmp.Name()
+	tmp.Write(raw)
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	clean, scanNote := scanFile(tmpPath)
+	if !clean {
+		http.Error(w, "rejected by file-scan gateway: "+scanNote, 422)
+		return
+	}
+
+	var sanitized bytes.Buffer
+	switch mime {
+	case "image/jpeg":
+		img, _, err := image.Decode(bytes.NewReader(raw))
+		if err != nil {
+			http.Error(w, "corrupt jpeg", 400)
+			return
+		}
+		if err := jpeg.Encode(&sanitized, img, &jpeg.Options{Quality: 88}); err != nil {
+			http.Error(w, "encode failed", 500)
+			return
+		}
+	case "image/png":
+		img, _, err := image.Decode(bytes.NewReader(raw))
+		if err != nil {
+			http.Error(w, "corrupt png", 400)
+			return
+		}
+		if err := png.Encode(&sanitized, img); err != nil {
+			http.Error(w, "encode failed", 500)
+			return
+		}
+	case "image/gif":
+		g, err := gif.DecodeAll(bytes.NewReader(raw))
+		if err != nil {
+			http.Error(w, "corrupt gif", 400)
+			return
+		}
+		if err := gif.EncodeAll(&sanitized, g); err != nil {
+			http.Error(w, "encode failed", 500)
+			return
+		}
+	}
+
+	idBytes := make([]byte, 12)
+	rand.Read(idBytes)
+	outName := hex.EncodeToString(idBytes) + ext
+	if err := os.WriteFile(filepath.Join(mediaDir, outName), sanitized.Bytes(), 0644); err != nil {
+		http.Error(w, "write failed", 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"url":  "/media/" + outName,
+		"mime": mime,
+		"scan": scanNote,
+		"size": sanitized.Len(),
+	})
+}
+
+func apiMedia(w http.ResponseWriter, r *http.Request) {
+	name := filepath.Base(strings.TrimPrefix(r.URL.Path, "/media/"))
+	if name == "" || name == "." || strings.Contains(name, "..") {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	http.ServeFile(w, r, filepath.Join(mediaDir, name))
+}
+
+func apiWS(w http.ResponseWriter, r *http.Request) {
+	u, ok := who(r)
+	if !ok {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	roomID := r.URL.Query().Get("room")
+	if roomID == "" {
+		roomID = "main"
+	}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	c := &wsClient{conn: conn, user: u, room: roomID, send: make(chan []byte, 64)}
+
+	mu.Lock()
+	rm := getOrCreateRoomLocked(roomID, u.Name)
+	clients[c] = true
+	broadcastRoomStateLocked(rm)
+	mu.Unlock()
+
+	go func() {
+		defer conn.Close()
+		for b := range c.send {
+			if err := conn.WriteMessage(websocket.TextMessage, b); err != nil {
+				break
+			}
+		}
+	}()
+
+	defer func() {
+		mu.Lock()
+		delete(clients, c)
+		close(c.send)
+		if rm, ok := rooms[c.room]; ok {
+			broadcastRoomStateLocked(rm)
+		}
+		mu.Unlock()
+		conn.Close()
+	}()
+
+	for {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		var evt struct {
+			Type string          `json:"type"`
+			To   string          `json:"to"`
+			Data json.RawMessage `json:"data"`
+		}
+		if json.Unmarshal(raw, &evt) != nil {
+			continue
+		}
+		if evt.Type == "rtc_signal" {
+			mu.Lock()
+			rm := rooms[c.room]
+			if rm != nil && rm.AudioMode == "live" {
+				out, _ := json.Marshal(map[string]any{
+					"type": "rtc_signal",
+					"from": c.user.Name,
+					"to":   evt.To,
+					"data": evt.Data,
+				})
+				for peer := range clients {
+					if peer != c && peer.room == c.room && (evt.To == "" || peer.user.Name == evt.To) {
+						select {
+						case peer.send <- out:
+						default:
+						}
+					}
+				}
+			}
+			mu.Unlock()
+		}
+	}
+}
+
+const openapi = `{"openapi":"3.1.0","info":{"title":"MateFlow Chat","version":"2"},
+"servers":[{"url":"https://chat.mateflowlabs.com"}],
+"components":{"securitySchemes":{"key":{"type":"http","scheme":"bearer"}}},"security":[{"key":[]}],
+"paths":{"/api/messages":{
+"get":{"operationId":"readMessages","summary":"Read messages newer than 'since'","parameters":[{"name":"since","in":"query","schema":{"type":"integer"}},{"name":"room","in":"query","schema":{"type":"string"}}],"responses":{"200":{"description":"messages"}}},
+"post":{"operationId":"postMessage","summary":"Post a message","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","required":["text"],"properties":{"text":{"type":"string"},"room":{"type":"string"}}}}}},"responses":{"200":{"description":"posted"}}}}}}`
+
+
+func apiRoomAuction(w http.ResponseWriter, r *http.Request) {
+u, ok := who(r)
+if !ok {
+http.Error(w, "unauthorized", 401)
+return
+}
+if r.Method != "POST" {
+http.Error(w, "method not allowed", 405)
+return
+}
+roomID := r.URL.Query().Get("room")
+var in struct {
+Action string  `json:"action"` // start, bid, stop
+Title  string  `json:"title"`
+Price  float64 `json:"price"`
+}
+if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2048)).Decode(&in); err != nil {
+http.Error(w, "bad request", 400)
+return
+}
+mu.Lock()
+rm := getOrCreateRoomLocked(roomID, u.Name)
+if in.Action == "bid" {
+if !rm.Auction.Active {
+mu.Unlock()
+http.Error(w, "no active auction", 400)
+return
+}
+if in.Price <= rm.Auction.HighBid || in.Price < rm.Auction.StartPrice {
+mu.Unlock()
+http.Error(w, "bid must beat current high bid", 400)
+return
+}
+rm.Auction.HighBid = in.Price
+rm.Auction.HighBidder = u.Name
+saveRoomsLocked()
+broadcastRoomStateLocked(rm)
+snap := roomSnapshotLocked(rm, u.Name)
+mu.Unlock()
+w.Header().Set("Content-Type", "application/json")
+json.NewEncoder(w).Encode(snap)
+return
+}
+if !canHostRoom(u, rm) {
+mu.Unlock()
+http.Error(w, "forbidden: host only", 403)
+return
+}
+switch in.Action {
+case "start":
+rm.Auction = AuctionState{Active: true, ItemTitle: strings.TrimSpace(in.Title), StartPrice: in.Price, HighBid: in.Price, HighBidder: ""}
+case "stop":
+rm.Auction.Active = false
+}
+saveRoomsLocked()
+broadcastRoomStateLocked(rm)
+snap := roomSnapshotLocked(rm, u.Name)
+mu.Unlock()
+w.Header().Set("Content-Type", "application/json")
+json.NewEncoder(w).Encode(snap)
+}
+
+func triggerAIMentions(room, fromUser, text string) {
+bots := []struct {
+Mention string
+Name    string
+Model   string
+Persona string
+}{
+{"@cyra", "cyra", "qwen2.5:7b", "You are Cyra, a sharp and friendly MateFlow AI co-host. Keep replies concise (1-3 sentences)."},
+{"@muse", "muse", "qwen3:30b", "You are Muse, a creative MateFlow AI stylist & curator. Keep replies concise (1-3 sentences)."},
+{"@openclaw", "openclaw", "qwen2.5:7b", "You are OpenClaw, a fast technical MateFlow AI ops agent. Keep replies concise (1-3 sentences)."},
+{"@hermes", "hermes", "qwen3:30b-a3b", "You are Hermes, a MateFlow commerce & auction messenger AI. Keep replies concise (1-3 sentences)."},
+{"@grok", "grok", "grok-3-latest:latest", "You are Grok, a witty and direct MateFlow AI assistant. Keep replies concise (1-3 sentences)."},
+}
+low := strings.ToLower(text)
+for _, b := range bots {
+if strings.Contains(low, b.Mention) {
+go func(bot struct {
+Mention string
+Name    string
+Model   string
+Persona string
+}) {
+payload := map[string]any{
+"model":  bot.Model,
+"stream": false,
+"messages": []map[string]string{
+{"role": "system", "content": bot.Persona},
+{"role": "user", "content": fromUser + " says: " + text},
+},
+}
+jb, _ := json.Marshal(payload)
+client := &http.Client{Timeout: 45 * time.Second}
+resp, err := client.Post("http://127.0.0.1:11434/api/chat", "application/json", bytes.NewReader(jb))
+reply := ""
+if err == nil {
+defer resp.Body.Close()
+var out struct {
+Message struct {
+Content string `json:"content"`
+} `json:"message"`
+}
+if json.NewDecoder(resp.Body).Decode(&out) == nil {
+reply = strings.TrimSpace(out.Message.Content)
+}
+}
+if reply == "" {
+reply = "[" + bot.Name + " online ? ask me anything!]"
+}
+mu.Lock()
+m := Msg{
+ID:   lastID + 1,
+Room: room,
+From: bot.Name,
+Role: "bot",
+Text: reply,
+At:   time.Now().UTC().Format(time.RFC3339),
+}
+lastID++
+msgs = append(msgs, m)
+saveAllMsgsLocked()
+broadcastRoomLocked(room, "chat", m)
+mu.Unlock()
+}(b)
+}
+}
+}
+
+func main() {
+	mrand.Seed(time.Now().UnixNano())
+	addr, keyPath, data := os.Getenv("MFCHAT_ADDR"), os.Getenv("MFCHAT_KEYS"), os.Getenv("MFCHAT_DATA")
+	loadKeys(keyPath)
+	initRooms()
+
+	if f, err := os.Open(data); err == nil {
+		s := bufio.NewScanner(f)
+		s.Buffer(make([]byte, 0, 1<<20), 1<<20)
+		for s.Scan() {
+			var m Msg
+			if json.Unmarshal(s.Bytes(), &m) == nil {
+				msgs = append(msgs, m)
+				lastID = m.ID
+			}
+		}
+		f.Close()
+	}
+	var err error
+	store, err = os.OpenFile(data, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	http.HandleFunc("/api/me", apiMe)
+	http.HandleFunc("/api/messages", apiMessages)
+	http.HandleFunc("/api/rooms", apiRooms)
+	http.HandleFunc("/api/rooms/store", apiRoomStore)
+	http.HandleFunc("/api/rooms/state", apiRoomState)
+	http.HandleFunc("/api/rooms/video", apiRoomVideo)
+	http.HandleFunc("/api/rooms/audio", apiRoomAudio)
+	http.HandleFunc("/api/rooms/follow", apiRoomFollow)
+	http.HandleFunc("/api/rooms/giveaway", apiRoomGiveaway)
+	http.HandleFunc("/api/rooms/auction", apiRoomAuction)
+	http.HandleFunc("/api/inventory", apiInventory)
+	http.HandleFunc("/api/upload", apiUpload)
+	http.HandleFunc("/media/", apiMedia)
+	http.HandleFunc("/ws", apiWS)
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+	http.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(openapi))
+	})
+
+	log.Printf("listening on %s, %d keys, %d messages, %d rooms", addr, len(keys), len(msgs), len(rooms))
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+===== FILE: index.html =====
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MateFlow Chat // Sandbox Terminal</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
+  <style>
+    :root {
+      --mf-bg-deep: #040814;
+      --mf-panel-bg: rgba(9, 17, 36, 0.78);
+      --mf-panel-alt: rgba(13, 24, 48, 0.72);
+      --mf-border: rgba(0, 243, 255, 0.22);
+      --mf-cyan: #00f3ff;
+      --mf-purple: #b026ff;
+      --mf-green: #00ff66;
+      --mf-text: #d9ecff;
+      --mf-muted: #7c93b8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 15% 15%, rgba(176, 38, 255, 0.14), transparent 40%),
+        radial-gradient(circle at 85% 80%, rgba(0, 243, 255, 0.12), transparent 42%),
+        linear-gradient(135deg, #03060f 0%, #071124 55%, #050a18 100%);
+      color: var(--mf-text);
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    .font-mono { font-family: "Cascadia Code", "Fira Code", Consolas, monospace; }
+    .glass {
+      background: var(--mf-panel-bg);
+      backdrop-filter: blur(14px);
+      border: 1px solid var(--mf-border);
+    }
+    .app-shell {
+      display: flex;
+      height: 100vh;
+      width: 100vw;
+      position: relative;
+    }
+    .sidebar-left {
+      width: 260px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--mf-border);
+      background: rgba(5, 10, 22, 0.85);
+    }
+    .main-stage {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      position: relative;
+    }
+    .drawer-right {
+      width: 340px;
+      flex-shrink: 0;
+      border-left: 1px solid var(--mf-border);
+      background: rgba(6, 12, 26, 0.9);
+      display: flex;
+      flex-direction: column;
+      transition: margin-right 0.22s ease, opacity 0.2s ease;
+    }
+    .drawer-right.collapsed {
+      margin-right: -340px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .channel-item {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--mf-muted);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: all 0.15s;
+    }
+    .channel-item:hover { background: rgba(0, 243, 255, 0.08); color: var(--mf-text); }
+    .channel-item.active {
+      background: rgba(0, 243, 255, 0.14);
+      border-color: rgba(0, 243, 255, 0.35);
+      color: var(--mf-cyan);
+    }
+    #messageStream {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .msg-card {
+      background: var(--mf-panel-alt);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 10px;
+      padding: 10px 14px;
+      max-width: 82%;
+    }
+    .msg-card.self {
+      align-self: flex-end;
+      border-color: rgba(0, 243, 255, 0.28);
+      background: rgba(0, 55, 80, 0.35);
+    }
+    .msg-img {
+      max-width: 320px;
+      max-height: 260px;
+      border-radius: 8px;
+      border: 1px solid var(--mf-border);
+      margin-top: 6px;
+      cursor: pointer;
+    }
+    .floating-player {
+      position: fixed;
+      top: 72px;
+      right: 365px;
+      width: 420px;
+      z-index: 1040;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.65);
+    }
+    .floating-player.minimized .player-body { display: none; }
+    .floating-header {
+      cursor: move;
+      background: rgba(8, 16, 36, 0.96);
+      border-bottom: 1px solid var(--mf-border);
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      user-select: none;
+    }
+    .emoji-popover {
+      position: absolute;
+      bottom: 74px;
+      left: 16px;
+      width: 280px;
+      padding: 10px;
+      border-radius: 10px;
+      z-index: 1050;
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 4px;
+    }
+    .emoji-btn {
+      background: transparent;
+      border: none;
+      font-size: 1.25rem;
+      padding: 4px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .emoji-btn:hover { background: rgba(255,255,255,0.12); }
+    .badge-role-admin { background: rgba(176, 38, 255, 0.25); color: #e2a8ff; border: 1px solid rgba(176, 38, 255, 0.5); }
+    .badge-role-seller { background: rgba(0, 243, 255, 0.18); color: var(--mf-cyan); border: 1px solid rgba(0, 243, 255, 0.4); }
+    .pulse-rec { animation: pulseRec 1.2s infinite; color: #ff4d6d !important; }
+    @keyframes pulseRec { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  </style>
+  <link rel="stylesheet" href="/mateflow-schemes.css" />
+  <style id="mf-scheme-bridge">
+    body { background-color: var(--mf-bg, #060B0A) !important; color: var(--mf-text, #E1EBE8) !important; font-family: var(--mf-font-body, sans-serif); }
+    .glass { background: var(--mf-glass-bg, rgba(13,22,21,0.9)) !important; backdrop-filter: blur(var(--mf-glass-blur, 12px)); border-color: var(--mf-outline-variant, #2F3D3A) !important; }
+    .text-info { color: var(--mf-accent-bright, #00FFD1) !important; }
+    .border-info, .border-info-subtle { border-color: var(--mf-accent, #00C49F) !important; }
+    .btn-outline-info { color: var(--mf-accent-bright, #00FFD1) !important; border-color: var(--mf-accent, #00C49F) !important; }
+    .btn-info { background-color: var(--mf-accent, #00C49F) !important; border-color: var(--mf-accent, #00C49F) !important; color: #030706 !important; }
+    .text-light { color: var(--mf-text, #E1EBE8) !important; }
+    .text-secondary { color: var(--mf-text-dim, #9AA9A6) !important; }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Left Sidebar -->
+    <aside class="sidebar-left p-3">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <div>
+          <div class="fw-bold text-info font-mono">MATEFLOW // SANDBOX</div>
+          <small class="text-secondary font-mono" id="connStatus">CONNECTING...</small>
+        </div>
+        <button class="btn btn-sm btn-outline-info" id="btnSettings" title="Auth / Identity"><i class="bi bi-key"></i></button>
+      </div>
+
+      <div class="p-2 rounded glass mb-3">
+        <div class="d-flex align-items-center justify-content-between">
+          <span class="fw-semibold" id="selfName">guest</span>
+          <span class="badge font-mono" id="selfRoleBadge">seller</span>
+        </div>
+        <button class="btn btn-xs btn-outline-secondary w-100 mt-2 py-1" style="font-size:0.75rem" id="btnMySellerRoom">
+          <i class="bi bi-shop me-1"></i>Open My Seller Room
+        </button>
+      </div>
+
+      <div class="text-uppercase text-secondary font-mono mb-2" style="font-size:0.72rem">Rooms & Channels</div>
+      <div id="roomList" class="d-flex flex-column gap-1 mb-3 overflow-auto" style="max-height: 36vh;"></div>
+
+      <div class="text-uppercase text-secondary font-mono mb-2" style="font-size:0.72rem">Online in Room</div>
+      <div id="onlineList" class="d-flex flex-wrap gap-1 mb-auto"></div>
+
+      <div class="pt-2 border-top border-secondary-subtle mt-2 d-flex gap-2">
+        <button class="btn btn-sm btn-outline-info flex-grow-1" id="btnTogglePlayer">
+          <i class="bi bi-play-btn me-1"></i>Player
+        </button>
+        <div class="d-inline-flex align-items-center gap-1 me-1">
+          <select id="mfSchemeSelect" class="form-select form-select-sm bg-dark text-light border-secondary" style="width:auto" title="Pipeline Skin">
+            <option value="">Default Emerald</option>
+            <option value="light-morning">Light Morning</option>
+            <option value="cyber-futuristic">Cyber Futuristic</option>
+            <option value="quantum-manifold">Quantum Manifold</option>
+            <option value="quantum-lobby">Quantum Lobby</option>
+            <option value="cobalt-sapphire">Cobalt Sapphire</option>
+            <option value="polymorphic-semantic">Polymorphic Semantic</option>
+            <option value="ultraviolet">Ultraviolet</option>
+            <option value="imperium">Imperium</option>
+            <option value="god-mode">God Mode</option>
+            <option value="god-mode-gold">God Mode Gold</option>
+            <option value="white-brown">White Brown</option>
+            <option value="metallic-webgl">Metallic WebGL</option>
+            <option value="white-black-metallic">White Black Metallic</option>
+            <option value="custom">Custom Colors</option>
+          </select>
+          <input type="color" id="mfPickBg" value="#060B0A" title="Custom Background" style="width:24px;height:24px;padding:0;border:none;background:none;cursor:pointer" />
+          <input type="color" id="mfPickAccent" value="#00FFD1" title="Custom Accent" style="width:24px;height:24px;padding:0;border:none;background:none;cursor:pointer" />
+        </div>
+        <button class="btn btn-sm btn-outline-light" id="btnToggleDrawer" title="Inventory & Giveaways">
+          <i class="bi bi-layout-sidebar-reverse"></i>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Chat Stage -->
+    <main class="main-stage">
+      <header class="glass px-3 py-2 d-flex align-items-center justify-content-between" style="border-top:0;border-left:0;border-right:0;">
+        <div class="d-flex align-items-center gap-2">
+          <span class="fw-bold fs-5 text-info font-mono" id="activeRoomTitle">#main-comms</span>
+          <span class="badge bg-dark border border-info-subtle font-mono" id="audioPolicyBadge">AUDIO: STT ONLY</span>
+          <span class="badge bg-dark border border-secondary font-mono" id="followerBadge">0 followers</span>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <!-- Host Audio Toggle -->
+          <button class="btn btn-sm btn-outline-warning d-none" id="btnHostAudioToggle">
+            <i class="bi bi-mic-fill me-1"></i><span>Enable Live Audio</span>
+          </button>
+          <button class="btn btn-sm btn-outline-info" id="btnFollowRoom">
+            <i class="bi bi-heart me-1"></i><span>Follow (1 Entry)</span>
+          </button>
+          <button class="btn btn-sm btn-outline-secondary" id="btnDrawerHeaderToggle">
+            <i class="bi bi-bag me-1"></i>Shop / Giveaway
+          </button>
+        </div>
+      </header>
+
+      <!-- Active Giveaway Banner -->
+      <div id="giveawayBanner" class="px-3 py-2 bg-dark border-bottom border-info-subtle d-none align-items-center justify-content-between">
+        <div class="font-mono small">
+          <i class="bi bi-gift-fill text-warning me-2"></i>
+          <span id="giveawayBannerText" class="text-light">Giveaway Active</span>
+        </div>
+        <span class="badge bg-warning text-dark font-mono" id="giveawayEntryCount">0 entries</span>
+      </div>
+
+      <!-- Messages -->
+      <div id="messageStream"></div>
+
+      <!-- Emoji Popover -->
+      <div id="emojiPopover" class="glass emoji-popover d-none"></div>
+
+      <!-- Composer -->
+      <footer class="glass p-2 m-2 rounded-3 position-relative" id="dropZone">
+        <form id="messageForm" class="d-flex align-items-center gap-2">
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="btnEmoji" title="Emojis"><i class="bi bi-emoji-smile"></i></button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="btnUpload" title="Upload JPEG/PNG/GIF (File-Scan Gateway)"><i class="bi bi-image"></i></button>
+          <input type="file" id="fileInput" accept="image/jpeg,image/png,image/gif" class="d-none" />
+          <button type="button" class="btn btn-sm btn-outline-info" id="btnMic" title="Voice (Live if Host enabled, else Speech-to-Text)">
+            <i class="bi bi-mic"></i>
+          </button>
+          <input type="text" id="messageInput" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Message room, paste image, or use mic..." autocomplete="off" />
+          <button type="submit" class="btn btn-sm btn-info fw-semibold px-3">Send</button>
+        </form>
+        <div class="d-flex justify-content-between px-1 pt-1 text-secondary font-mono" style="font-size:0.7rem">
+          <span id="telemetryLeft">READY</span>
+          <span id="telemetryRight">GATEWAY: CLAMAV + RE-ENCODE</span>
+        </div>
+      </footer>
+    </main>
+
+    <!-- Collapsible Right Drawer: Room Inventory & Giveaways -->
+    <aside class="drawer-right" id="rightDrawer">
+      <div class="p-2 border-bottom border-info-subtle d-flex align-items-center justify-content-between">
+        <ul class="nav nav-pills nav-fill w-100 gap-1" style="font-size:0.82rem">
+          <li class="nav-item">
+            <button class="nav-link active py-1" id="tabInvBtn" data-tab="inv"><i class="bi bi-box-seam me-1"></i>Inventory</button>
+          </li>
+          <li class="nav-item">
+            <button class="nav-link py-1" id="tabGiveBtn" data-tab="give"><i class="bi bi-gift me-1"></i>Giveaways</button>
+          </li>
+        </ul>
+      </div>
+
+      <!-- Inventory Tab -->
+      <div id="tabInv" class="p-3 overflow-auto flex-grow-1">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <span class="font-mono small text-info">ROOM INVENTORY</span>
+          <button class="btn btn-xs btn-outline-info py-0 px-2" style="font-size:0.75rem" id="btnRefreshInv"><i class="bi bi-arrow-clockwise"></i></button>
+        </div>
+        <a id="roomStoreBtn" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-outline-success w-100 mb-2 d-none">
+          <i class="bi bi-shop-window me-1"></i>Visit Seller Store
+        </a>
+        <div id="hostStoreBox" class="input-group input-group-sm mb-2 d-none">
+          <input id="storeUrlInput" class="form-control bg-dark text-light border-secondary" placeholder="Storefront URL (https://...)" />
+          <button type="button" class="btn btn-outline-info flex-shrink-0" id="btnSaveStoreUrl">Save</button>
+        </div>
+          <div id="storeSaveStatus" class="small mt-1 text-info d-none"></div>
+        <div id="inventoryList" class="d-flex flex-column gap-2 mb-3"></div>
+
+        <!-- Add Item (Host/Seller) -->
+        <div id="addInvBox" class="p-2 rounded glass mt-2 d-none">
+          <div class="font-mono small text-secondary mb-2">ADD ROOM ITEM</div>
+          <input id="invTitle" class="form-control form-control-sm mb-1 bg-dark text-light" placeholder="Item title" />
+          <div class="d-flex gap-1 mb-1">
+            <input id="invPrice" type="number" step="0.01" class="form-control form-control-sm bg-dark text-light" placeholder="Price" />
+            <input id="invQty" type="number" class="form-control form-control-sm bg-dark text-light" placeholder="Qty" value="1" />
+          </div>
+          <input id="invUrl" class="form-control form-control-sm mb-1 bg-dark text-light" placeholder="Product / Checkout URL (https://...)" />
+          <button id="btnAddInv" class="btn btn-sm btn-outline-info w-100">Add to Room</button>
+        </div>
+      </div>
+
+      <!-- Giveaway Tab -->
+      <div id="tabGive" class="p-3 overflow-auto flex-grow-1 d-none">
+        <div class="p-3 rounded glass mb-3">
+          <div class="font-mono small text-warning mb-1"><i class="bi bi-trophy me-1"></i>FOLLOW = 1 ENTRY</div>
+          <div id="giveawayStatusText" class="small text-light mb-2">No active giveaway.</div>
+          <div id="giveawayWinnerBox" class="alert alert-success py-1 px-2 small d-none"></div>
+          <button id="btnDrawerFollow" class="btn btn-sm btn-info w-100 mb-2">Follow Seller & Enter</button>
+          <div class="small text-secondary font-mono" id="giveawayEntriesList"></div>
+        </div>
+
+        <div id="hostGiveawayControls" class="p-2 rounded glass d-none">
+          <div class="font-mono small text-secondary mb-2">HOST GIVEAWAY CONTROLS</div>
+          <input id="giveawayTitleInput" class="form-control form-control-sm mb-2 bg-dark text-light" placeholder="Prize title (e.g. Mystery Slab)" />
+          <div class="d-flex gap-2">
+            <button id="btnStartGiveaway" class="btn btn-sm btn-outline-warning flex-grow-1">Start</button>
+            <button id="btnDrawGiveaway" class="btn btn-sm btn-success flex-grow-1">Draw Winner</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Floating Player ("BoysTown Live" / Watch a Movie Together) -->
+  <div id="floatingPlayer" class="floating-player glass">
+    <div class="floating-header" id="floatingHeader">
+      <div class="d-flex align-items-center gap-2">
+        <span class="badge bg-danger font-mono">LIVE</span>
+        <span class="font-mono small text-info" id="playerRoomLabel">BoysTown Live</span>
+      </div>
+      <div class="d-flex gap-1">
+        <button class="btn btn-xs btn-outline-secondary py-0 px-1" id="btnMinPlayer" title="Minimize"><i class="bi bi-dash"></i></button>
+        <button class="btn btn-xs btn-outline-secondary py-0 px-1" id="btnClosePlayer" title="Hide"><i class="bi bi-x"></i></button>
+      </div>
+    </div>
+    <div class="player-body bg-black">
+      <video id="syncVideo" class="w-100" style="max-height:240px;background:#000" controls playsinline></video>
+      <div id="hostVideoControls" class="p-2 border-top border-info-subtle bg-dark d-none">
+        <div class="input-group input-group-sm mb-1">
+          <input id="videoUrlInput" class="form-control bg-black text-light border-secondary" placeholder="MP4 / WebM URL to Watch Together" />
+          <button class="btn btn-outline-info" id="btnLoadVideo">Load</button>
+        </div>
+        <div class="d-flex gap-1">
+          <button class="btn btn-xs btn-outline-success flex-grow-1 py-0" id="btnHostPlay"><i class="bi bi-play-fill"></i> Sync Play</button>
+          <button class="btn btn-xs btn-outline-warning flex-grow-1 py-0" id="btnHostPause"><i class="bi bi-pause-fill"></i> Sync Pause</button>
+        </div>
+      </div>
+      <div id="remoteAudioContainer" class="d-none"></div>
+    </div>
+  </div>
+
+  <!-- Auth Modal -->
+  <div class="modal fade" id="authModal" data-bs-backdrop="static" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <form id="authForm" class="modal-content glass text-light">
+        <div class="modal-header border-secondary">
+          <h5 class="modal-title font-mono text-info">MATEFLOW // ACCESS KEY</h5>
+        </div>
+        <div class="modal-body">
+          <div id="authError" class="alert alert-danger py-1 small d-none">Invalid key.</div>
+          <label class="form-label small font-mono">Bearer Key</label>
+          <input id="inputKey" type="password" class="form-control bg-dark text-light border-secondary" required />
+        </div>
+        <div class="modal-footer border-secondary">
+          <button type="submit" class="btn btn-info fw-semibold w-100">Connect</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    (() => {
+      const STORAGE_KEY = "mfchat_key";
+      let apiKey = localStorage.getItem(STORAGE_KEY) || "";
+      let me = { name: "guest", role: "seller" };
+      let activeRoom = "main";
+      let roomState = null;
+      let lastId = 0;
+      let ws = null;
+      let localStream = null;
+      let peers = {};
+      let sttRecognition = null;
+      let isMicActive = false;
+
+      const authModal = new bootstrap.Modal(document.getElementById("authModal"));
+      const streamEl = document.getElementById("messageStream");
+      const syncVideo = document.getElementById("syncVideo");
+      const EMOJIS = ["\u{1F525}","\u{1F680}","\u{1F4B0}","\u{1F389}","\u{1F44D}","\u{2764}\u{FE0F}","\u{1F602}","\u{1F60E}","\u{1F4AF}","\u{26A1}","\u{1F3AC}","\u{1F3A4}","\u{1F6D2}","\u{1F3F7}\u{FE0F}","\u{1F4E6}","\u{2705}","\u{1F440}","\u{1F64C}","\u{1F91D}","\u{1F48E}","\u{1F3C6}"];
+
+      function hdr(json = true) {
+        const h = { "Authorization": "Bearer " + apiKey };
+        if (json) h["Content-Type"] = "application/json";
+        return h;
+      }
+
+      function canHost() {
+        return me.role === "admin" || (roomState && roomState.owner === me.name);
+      }
+
+      async function api(url, opts = {}) {
+        const res = await fetch(url, opts);
+        if (res.status === 401) {
+          localStorage.removeItem(STORAGE_KEY);
+          document.getElementById("authError").classList.remove("d-none");
+          authModal.show();
+          throw new Error("unauthorized");
+        }
+        if (!res.ok) throw new Error(await res.text() || ("HTTP " + res.status));
+        return res.json();
+      }
+
+      // Emoji picker setup
+      const emojiPop = document.getElementById("emojiPopover");
+      EMOJIS.forEach(em => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "emoji-btn";
+        b.textContent = em;
+        b.onclick = () => {
+          const inp = document.getElementById("messageInput");
+          inp.value += em;
+          inp.focus();
+          emojiPop.classList.add("d-none");
+        };
+        emojiPop.appendChild(b);
+      });
+      document.getElementById("btnEmoji").onclick = () => emojiPop.classList.toggle("d-none");
+
+      // Draggable Floating Player
+      (() => {
+        const box = document.getElementById("floatingPlayer");
+        const hdrEl = document.getElementById("floatingHeader");
+        let dx = 0, dy = 0, dragging = false;
+        hdrEl.onmousedown = (e) => {
+          if (e.target.closest("button")) return;
+          dragging = true;
+          dx = e.clientX - box.offsetLeft;
+          dy = e.clientY - box.offsetTop;
+        };
+        window.onmousemove = (e) => {
+          if (!dragging) return;
+          box.style.left = Math.max(0, e.clientX - dx) + "px";
+          box.style.top = Math.max(0, e.clientY - dy) + "px";
+          box.style.right = "auto";
+        };
+        window.onmouseup = () => { dragging = false; };
+      })();
+
+      document.getElementById("btnMinPlayer").onclick = () => document.getElementById("floatingPlayer").classList.toggle("minimized");
+      document.getElementById("btnClosePlayer").onclick = () => document.getElementById("floatingPlayer").classList.add("d-none");
+      document.getElementById("btnTogglePlayer").onclick = () => document.getElementById("floatingPlayer").classList.toggle("d-none");
+
+      function toggleDrawer() {
+        document.getElementById("rightDrawer").classList.toggle("collapsed");
+      }
+      document.getElementById("btnToggleDrawer").onclick = toggleDrawer;
+      document.getElementById("btnDrawerHeaderToggle").onclick = toggleDrawer;
+
+      document.querySelectorAll("[data-tab]").forEach(btn => {
+        btn.onclick = () => {
+          document.querySelectorAll("[data-tab]").forEach(b => b.classList.remove("active"));
+          btn.classList.add("active");
+          document.getElementById("tabInv").classList.toggle("d-none", btn.dataset.tab !== "inv");
+          document.getElementById("tabGive").classList.toggle("d-none", btn.dataset.tab !== "give");
+        };
+      });
+
+      function appendMessage(m) {
+        if (m.id && m.id <= lastId) return;
+        if (m.id) lastId = m.id;
+        const card = document.createElement("div");
+        card.className = "msg-card" + (m.from === me.name ? " self" : "");
+        const top = document.createElement("div");
+        top.className = "d-flex align-items-center gap-2 mb-1";
+        const nameEl = document.createElement("span");
+        nameEl.className = "fw-bold text-info small";
+        nameEl.textContent = m.from;
+        top.appendChild(nameEl);
+        if (m.role) {
+          const rb = document.createElement("span");
+          rb.className = "badge font-mono " + (m.role === "admin" ? "badge-role-admin" : "badge-role-seller");
+          rb.style.fontSize = "0.65rem";
+          rb.textContent = m.role;
+          top.appendChild(rb);
+        }
+        if (m.stt) {
+          const sb = document.createElement("span");
+          sb.className = "badge bg-secondary font-mono";
+          sb.style.fontSize = "0.62rem";
+          sb.textContent = "STT";
+          top.appendChild(sb);
+        }
+        const timeEl = document.createElement("span");
+        timeEl.className = "text-secondary font-mono ms-auto";
+        timeEl.style.fontSize = "0.68rem";
+        timeEl.textContent = m.at ? new Date(m.at).toLocaleTimeString([], { hour12: false }) : "";
+        top.appendChild(timeEl);
+        card.appendChild(top);
+
+        if (m.text) {
+          const body = document.createElement("div");
+          body.className = "small";
+          body.style.whiteSpace = "pre-wrap";
+          body.textContent = m.text;
+          card.appendChild(body);
+        }
+        if (m.media_url) {
+          const img = document.createElement("img");
+          img.src = m.media_url;
+          img.className = "msg-img d-block";
+          img.onclick = () => window.open(m.media_url, "_blank");
+          card.appendChild(img);
+        }
+        if (m.pinned_item) {
+          const box = document.createElement("div");
+          box.className = "mt-2 p-2 rounded border border-info-subtle bg-dark small";
+          const linkHtml = (m.pinned_item.url && /^https?:\/\//i.test(m.pinned_item.url))
+            ? `<a href="${m.pinned_item.url}" target="_blank" rel="noopener noreferrer" class="btn btn-xs btn-success py-0 px-2 mt-1">View / Buy <i class="bi bi-box-arrow-up-right ms-1"></i></a>`
+            : "";
+          box.innerHTML = `<div class="fw-bold text-info"><i class="bi bi-pin-angle-fill me-1"></i>${m.pinned_item.title}</div>
+            <div class="font-mono text-success">$${Number(m.pinned_item.price).toFixed(2)} ? Qty: ${m.pinned_item.quantity}</div>${linkHtml}`;
+          card.appendChild(box);
+        }
+        streamEl.appendChild(card);
+        streamEl.scrollTop = streamEl.scrollHeight;
+      }
+
+      function applyRoomState(rs) {
+        roomState = rs;
+        document.getElementById("activeRoomTitle").textContent = rs.title || rs.id;
+        document.getElementById("playerRoomLabel").textContent = rs.title || rs.id;
+        document.getElementById("followerBadge").textContent = `${rs.follower_count || 0} followers`;
+
+        const audioBadge = document.getElementById("audioPolicyBadge");
+        const isLive = rs.audio_mode === "live";
+        audioBadge.textContent = isLive ? "AUDIO: LIVE MIC" : "AUDIO: STT ONLY";
+        audioBadge.className = "badge font-mono " + (isLive ? "bg-success" : "bg-dark border border-info-subtle");
+
+        const followBtn = document.getElementById("btnFollowRoom");
+        followBtn.innerHTML = rs.followed_by_me ? '<i class="bi bi-heart-fill text-danger me-1"></i>Followed (Entered)' : '<i class="bi bi-heart me-1"></i>Follow (1 Entry)';
+
+        // Host controls visibility
+        const host = canHost();
+        document.getElementById("btnHostAudioToggle").classList.toggle("d-none", !host);
+        document.getElementById("btnHostAudioToggle").querySelector("span").textContent = isLive ? "Switch to STT-Only" : "Enable Live Audio";
+        document.getElementById("hostVideoControls").classList.toggle("d-none", !host);
+        document.getElementById("hostGiveawayControls").classList.toggle("d-none", !host);
+        document.getElementById("addInvBox").classList.toggle("d-none", !(host || me.role === "seller"));
+        document.getElementById("hostStoreBox").classList.toggle("d-none", !host);
+        const sui = document.getElementById("storeUrlInput"); if (sui && document.activeElement !== sui) sui.value = rs.store_url || "";
+        const storeBtn = document.getElementById("roomStoreBtn");
+        if (rs.store_url && /^https?:\/\//i.test(rs.store_url)) {
+          storeBtn.href = rs.store_url;
+          storeBtn.classList.remove("d-none");
+        } else {
+          storeBtn.classList.add("d-none");
+        }
+
+        // Online badges
+        const onlineEl = document.getElementById("onlineList");
+        onlineEl.innerHTML = "";
+        (rs.online || []).forEach(u => {
+          const sp = document.createElement("span");
+          sp.className = "badge bg-dark border border-info-subtle font-mono";
+          sp.textContent = u;
+          onlineEl.appendChild(sp);
+        });
+
+        // Video sync
+        if (rs.video && rs.video.url) {
+          if (syncVideo.dataset.src !== rs.video.url) {
+            syncVideo.dataset.src = rs.video.url;
+            syncVideo.src = rs.video.url;
+            document.getElementById("videoUrlInput").value = rs.video.url;
+          }
+          const drift = rs.video.playing ? (Date.now() - rs.video.updated_at) / 1000 : 0;
+          const target = Math.max(0, (rs.video.position || 0) + drift);
+          if (Math.abs((syncVideo.currentTime || 0) - target) > 1.8) {
+            syncVideo.currentTime = target;
+          }
+          if (rs.video.playing && syncVideo.paused) syncVideo.play().catch(() => {});
+          if (!rs.video.playing && !syncVideo.paused) syncVideo.pause();
+        }
+
+        // Giveaway UI
+        const gw = rs.giveaway || {};
+        const banner = document.getElementById("giveawayBanner");
+        if (gw.active) {
+          banner.classList.remove("d-none");
+          banner.classList.add("d-flex");
+          document.getElementById("giveawayBannerText").textContent = `GIVEAWAY: ${gw.title} ? Follow seller for 1 entry!`;
+          document.getElementById("giveawayEntryCount").textContent = `${(gw.entries || []).length} entries`;
+          document.getElementById("giveawayStatusText").textContent = `Active: ${gw.title} (${(gw.entries || []).length} entries)`;
+        } else {
+          banner.classList.add("d-none");
+          banner.classList.remove("d-flex");
+          document.getElementById("giveawayStatusText").textContent = "No active giveaway right now.";
+        }
+        const winBox = document.getElementById("giveawayWinnerBox");
+        if (gw.winner) {
+          winBox.classList.remove("d-none");
+          winBox.textContent = `Winner: ${gw.winner}!`;
+        } else {
+          winBox.classList.add("d-none");
+        }
+        document.getElementById("giveawayEntriesList").textContent = (gw.entries && gw.entries.length) ? ("Entries: " + gw.entries.join(", ")) : "";
+      }
+
+      async function loadRooms() {
+        const list = await api("/api/rooms", { headers: hdr(false) });
+        const el = document.getElementById("roomList");
+        el.innerHTML = "";
+        list.sort((a, b) => a.id.localeCompare(b.id)).forEach(r => {
+          const btn = document.createElement("button");
+          btn.className = "channel-item" + (r.id === activeRoom ? " active" : "");
+          btn.innerHTML = `<span>${r.title || r.id}</span><span class="badge bg-dark font-mono">${(r.online || []).length}</span>`;
+          btn.onclick = () => switchRoom(r.id);
+          el.appendChild(btn);
+        });
+      }
+
+      async function loadInventory() {
+        const items = await api("/api/inventory?room=" + encodeURIComponent(activeRoom), { headers: hdr(false) });
+        const el = document.getElementById("inventoryList");
+        el.innerHTML = "";
+        if (!items.length) {
+          el.innerHTML = '<div class="small text-secondary">No items in this room yet.</div>';
+          return;
+        }
+        items.forEach(it => {
+          const card = document.createElement("div");
+          card.className = "p-2 rounded glass";
+          card.innerHTML = `
+            <div class="d-flex justify-content-between align-items-start">
+              <div class="fw-semibold small text-light">${it.title}</div>
+              <span class="badge bg-success font-mono">$${Number(it.price).toFixed(2)}</span>
+            </div>
+            <div class="text-secondary font-mono mt-1" style="font-size:0.72rem">Qty: ${it.quantity} ? ${it.condition || "NEW"}</div>
+            <div class="d-flex gap-1 mt-2">
+              <button class="btn btn-xs btn-outline-info flex-grow-1 py-0 pin-btn">Pin to Chat</button>
+              ${(it.url && /^https?:\/\//i.test(it.url)) ? `<a href="${it.url}" target="_blank" rel="noopener noreferrer" class="btn btn-xs btn-success py-0 px-2">Buy / Link</a>` : ""}
+            </div>`;
+          card.querySelector(".pin-btn").onclick = async () => {
+            await api("/api/messages", {
+              method: "POST",
+              headers: hdr(),
+              body: JSON.stringify({ room: activeRoom, text: `Pinned item: ${it.title}`, pinned_item: it })
+            });
+          };
+          el.appendChild(card);
+        });
+      }
+
+      function connectWS() {
+        if (ws) ws.close();
+        const proto = location.protocol === "https:" ? "wss://" : "ws://";
+        ws = new WebSocket(`${proto}${location.host}/ws?room=${encodeURIComponent(activeRoom)}&token=${encodeURIComponent(apiKey)}`);
+        ws.onopen = () => { document.getElementById("connStatus").textContent = "WS // ONLINE"; };
+        ws.onclose = () => { document.getElementById("connStatus").textContent = "WS // RECONNECTING"; setTimeout(connectWS, 2500); };
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "chat") appendMessage(msg.data);
+          if (msg.type === "room_state") applyRoomState(msg.data);
+          if (msg.type === "rtc_signal") handleRTCSignal(msg.from, msg.data);
+        };
+      }
+
+      async function switchRoom(roomId) {
+        activeRoom = roomId;
+        lastId = 0;
+        streamEl.innerHTML = "";
+        stopMic();
+        await loadRooms();
+        const msgs = await api(`/api/messages?room=${encodeURIComponent(activeRoom)}&since=0`, { headers: hdr(false) });
+        msgs.forEach(appendMessage);
+        const rs = await api(`/api/rooms/state?room=${encodeURIComponent(activeRoom)}`, { headers: hdr(false) });
+        applyRoomState(rs);
+        await loadInventory();
+        connectWS();
+      }
+
+      // File-Scan Upload Gateway (JPEG/PNG/GIF)
+      async function uploadFile(file) {
+        if (!file) return;
+        const tel = document.getElementById("telemetryLeft");
+        tel.textContent = "SCANNING VIA CLAMAV GATEWAY...";
+        const fd = new FormData();
+        fd.append("file", file);
+        try {
+          const res = await api("/api/upload", { method: "POST", headers: hdr(false), body: fd });
+          tel.textContent = `CLEAN (${res.scan}) // POSTING MEDIA`;
+          await api("/api/messages", {
+            method: "POST",
+            headers: hdr(),
+            body: JSON.stringify({ room: activeRoom, text: "", media_url: res.url, media_type: res.mime })
+          });
+          tel.textContent = "READY";
+        } catch (err) {
+          tel.textContent = "UPLOAD BLOCKED: " + err.message;
+        }
+      }
+
+      document.getElementById("btnUpload").onclick = () => document.getElementById("fileInput").click();
+      document.getElementById("fileInput").onchange = (e) => uploadFile(e.target.files[0]);
+      document.getElementById("messageInput").addEventListener("paste", (e) => {
+        const item = Array.from(e.clipboardData?.items || []).find(i => i.type.startsWith("image/"));
+        if (item) uploadFile(item.getAsFile());
+      });
+
+      // Audio Policy: Host Live Audio (WebRTC) vs Speech-to-Text Fallback
+      async function handleRTCSignal(from, data) {
+        if (!roomState || roomState.audio_mode !== "live") return;
+        let pc = peers[from];
+        if (!pc) {
+          pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+          peers[from] = pc;
+          pc.onicecandidate = (e) => {
+            if (e.candidate && ws) ws.send(JSON.stringify({ type: "rtc_signal", to: from, data: { candidate: e.candidate } }));
+          };
+          pc.ontrack = (e) => {
+            let a = document.getElementById("audio-" + from);
+            if (!a) {
+              a = document.createElement("audio");
+              a.id = "audio-" + from;
+              a.autoplay = true;
+              document.getElementById("remoteAudioContainer").appendChild(a);
+            }
+            a.srcObject = e.streams[0];
+          };
+          if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+        }
+        if (data.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          if (data.sdp.type === "offer") {
+            const ans = await pc.createAnswer();
+            await pc.setLocalDescription(ans);
+            ws.send(JSON.stringify({ type: "rtc_signal", to: from, data: { sdp: pc.localDescription } }));
+          }
+        } else if (data.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
+        }
+      }
+
+      function stopMic() {
+        isMicActive = false;
+        document.getElementById("btnMic").classList.remove("pulse-rec");
+        if (sttRecognition) { try { sttRecognition.stop(); } catch {} sttRecognition = null; }
+        if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+        Object.values(peers).forEach(p => p.close());
+        peers = {};
+      }
+
+      document.getElementById("btnMic").onclick = async () => {
+        if (isMicActive) { stopMic(); return; }
+        isMicActive = true;
+        document.getElementById("btnMic").classList.add("pulse-rec");
+
+        if (roomState && roomState.audio_mode === "live") {
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            (roomState.online || []).filter(u => u !== me.name).forEach(async peerName => {
+              const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+              peers[peerName] = pc;
+              localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+              pc.onicecandidate = (e) => {
+                if (e.candidate && ws) ws.send(JSON.stringify({ type: "rtc_signal", to: peerName, data: { candidate: e.candidate } }));
+              };
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              ws.send(JSON.stringify({ type: "rtc_signal", to: peerName, data: { sdp: pc.localDescription } }));
+            });
+            document.getElementById("telemetryLeft").textContent = "LIVE AUDIO STREAMING";
+          } catch (err) {
+            stopMic();
+            document.getElementById("telemetryLeft").textContent = "MIC ERROR: " + err.message;
+          }
+        } else {
+          const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (!SR) {
+            stopMic();
+            alert("Speech-to-Text not supported in this browser (try Chrome/Edge).");
+            return;
+          }
+          sttRecognition = new SR();
+          sttRecognition.continuous = true;
+          sttRecognition.interimResults = false;
+          sttRecognition.onresult = async (ev) => {
+            const transcript = ev.results[ev.results.length - 1][0].transcript.trim();
+            if (transcript) {
+              await api("/api/messages", {
+                method: "POST",
+                headers: hdr(),
+                body: JSON.stringify({ room: activeRoom, text: transcript, stt: true })
+              });
+            }
+          };
+          sttRecognition.onend = () => { if (isMicActive) sttRecognition.start(); };
+          sttRecognition.start();
+          document.getElementById("telemetryLeft").textContent = "STT ACTIVE (HOST DISABLED LIVE AUDIO)";
+        }
+      };
+
+      // Form & Button Handlers
+      document.getElementById("messageForm").onsubmit = async (e) => {
+        e.preventDefault();
+        const inp = document.getElementById("messageInput");
+        const text = inp.value.trim();
+        if (!text) return;
+        inp.value = "";
+        await api("/api/messages", {
+          method: "POST",
+          headers: hdr(),
+          body: JSON.stringify({ room: activeRoom, text })
+        });
+      };
+
+      document.getElementById("btnHostAudioToggle").onclick = async () => {
+        const next = roomState?.audio_mode === "live" ? "stt_only" : "live";
+        await api(`/api/rooms/audio?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ audio_mode: next })
+        });
+      };
+
+      async function followRoom() {
+        await api(`/api/rooms/follow?room=${encodeURIComponent(activeRoom)}`, { method: "POST", headers: hdr() });
+      }
+      document.getElementById("btnFollowRoom").onclick = followRoom;
+      document.getElementById("btnDrawerFollow").onclick = followRoom;
+
+      document.getElementById("btnStartGiveaway").onclick = async () => {
+        const title = document.getElementById("giveawayTitleInput").value.trim();
+        await api(`/api/rooms/giveaway?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "start", title })
+        });
+      };
+      document.getElementById("btnDrawGiveaway").onclick = async () => {
+        await api(`/api/rooms/giveaway?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "draw" })
+        });
+      };
+
+      document.getElementById("btnLoadVideo").onclick = async () => {
+        const url = document.getElementById("videoUrlInput").value.trim();
+        await api(`/api/rooms/video?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "load", url })
+        });
+      };
+      document.getElementById("btnHostPlay").onclick = async () => {
+        await api(`/api/rooms/video?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "play", url: document.getElementById("videoUrlInput").value.trim(), position: syncVideo.currentTime || 0 })
+        });
+      };
+      document.getElementById("btnHostPause").onclick = async () => {
+        await api(`/api/rooms/video?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "pause", position: syncVideo.currentTime || 0 })
+        });
+      };
+
+      document.getElementById("btnRefreshInv").onclick = loadInventory;
+            const btnSaveStore = document.getElementById("btnSaveStoreUrl");
+      if (btnSaveStore) btnSaveStore.onclick = async () => {
+        const stEl = document.getElementById("storeSaveStatus");
+        const nameEl = document.getElementById("storeNameInput");
+        const urlEl = document.getElementById("storeUrlInput");
+        const store_name = nameEl ? nameEl.value.trim() : "";
+        let store_url = urlEl ? urlEl.value.trim() : "";
+        if (store_url && !/^https?:\/\//i.test(store_url)) {
+          store_url = "https://" + store_url;
+          if (urlEl) urlEl.value = store_url;
+        }
+        try {
+          const res = await api(`/api/rooms/store?room=${encodeURIComponent(activeRoom)}`, {
+            method: "POST", headers: hdr(), body: JSON.stringify({ store_name, store_url })
+          });
+          if (stEl) {
+            stEl.textContent = "Saved!";
+            stEl.className = "small mt-1 text-success";
+            stEl.classList.remove("d-none");
+            setTimeout(() => stEl.classList.add("d-none"), 2500);
+          }
+        } catch (err) {
+          if (stEl) {
+            stEl.textContent = "Save failed: " + (err.message || err);
+            stEl.className = "small mt-1 text-danger";
+            stEl.classList.remove("d-none");
+          }
+        }
+      };
+
+      document.getElementById("btnAddInv").onclick = async () => {
+        const title = document.getElementById("invTitle").value.trim();
+        const price = parseFloat(document.getElementById("invPrice").value || "0");
+        const quantity = parseInt(document.getElementById("invQty").value || "1", 10);
+        const url = document.getElementById("invUrl").value.trim();
+        if (!title) return;
+        await api(`/api/inventory?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ room: activeRoom, title, price, quantity, condition: "NEW", url })
+        });
+        document.getElementById("invTitle").value = "";
+        document.getElementById("invUrl").value = "";
+        await loadInventory();
+      };
+
+      document.getElementById("btnMySellerRoom").onclick = async () => {
+        const id = "seller:" + me.name;
+        await api("/api/rooms", { method: "POST", headers: hdr(), body: JSON.stringify({ id, title: "Seller // " + me.name }) });
+        await switchRoom(id);
+      };
+
+      document.getElementById("btnSettings").onclick = () => {
+        document.getElementById("inputKey").value = apiKey;
+        authModal.show();
+      };
+      document.getElementById("authForm").onsubmit = async (e) => {
+        e.preventDefault();
+        apiKey = document.getElementById("inputKey").value.trim();
+        localStorage.setItem(STORAGE_KEY, apiKey);
+        authModal.hide();
+        await boot();
+      };
+
+      async function boot() {
+        me = await api("/api/me", { headers: hdr(false) });
+        document.getElementById("selfName").textContent = me.name;
+        const rb = document.getElementById("selfRoleBadge");
+        rb.textContent = me.role;
+        rb.className = "badge font-mono " + (me.role === "admin" ? "badge-role-admin" : "badge-role-seller");
+        await switchRoom(activeRoom);
+      }
+
+      if (!apiKey) authModal.show();
+      else boot().catch(() => {});
+    })();
+  </script>
+<script>
+(function(){
+  const sel = document.getElementById("mfSchemeSelect");
+  const bg = document.getElementById("mfPickBg");
+  const ac = document.getElementById("mfPickAccent");
+  function clearCustom(){
+    document.documentElement.style.removeProperty("--mf-bg");
+    document.documentElement.style.removeProperty("--mf-accent");
+    document.documentElement.style.removeProperty("--mf-accent-bright");
+  }
+  function applyScheme(name, cbg, cac){
+    clearCustom();
+    if (name && name !== "custom") { document.documentElement.setAttribute("data-mf-scheme", name); }
+    else { document.documentElement.removeAttribute("data-mf-scheme"); }
+    if (name === "custom" && cbg && cac) {
+      document.documentElement.style.setProperty("--mf-bg", cbg);
+      document.documentElement.style.setProperty("--mf-accent", cac);
+      document.documentElement.style.setProperty("--mf-accent-bright", cac);
+    }
+    if (sel) sel.value = name || "";
+    if (cbg && bg) bg.value = cbg;
+    if (cac && ac) ac.value = cac;
+  }
+  const saved = JSON.parse(localStorage.getItem("mf_chat_scheme") || "null");
+  if (saved) applyScheme(saved.name, saved.bg, saved.ac);
+  if (sel) sel.addEventListener("change", () => {
+    const val = sel.value;
+    if (val === "custom") {
+      applyScheme("custom", bg.value, ac.value);
+      localStorage.setItem("mf_chat_scheme", JSON.stringify({ name: "custom", bg: bg.value, ac: ac.value }));
+    } else {
+      applyScheme(val, null, null);
+      localStorage.setItem("mf_chat_scheme", JSON.stringify({ name: val }));
+    }
+  });
+  [bg, ac].forEach(el => { if (el) el.addEventListener("input", () => {
+    applyScheme("custom", bg.value, ac.value);
+    localStorage.setItem("mf_chat_scheme", JSON.stringify({ name: "custom", bg: bg.value, ac: ac.value }));
+  }); });
+})();
+</script>
+</body>
+</html>
+
+===== FILE: index.html.bak =====
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MateFlow Chat // Sandbox Terminal</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
+  <style>
+    :root {
+      --mf-bg-deep: #040814;
+      --mf-panel-bg: rgba(9, 17, 36, 0.78);
+      --mf-panel-alt: rgba(13, 24, 48, 0.72);
+      --mf-border: rgba(0, 243, 255, 0.22);
+      --mf-cyan: #00f3ff;
+      --mf-purple: #b026ff;
+      --mf-green: #00ff66;
+      --mf-text: #d9ecff;
+      --mf-muted: #7c93b8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 15% 15%, rgba(176, 38, 255, 0.14), transparent 40%),
+        radial-gradient(circle at 85% 80%, rgba(0, 243, 255, 0.12), transparent 42%),
+        linear-gradient(135deg, #03060f 0%, #071124 55%, #050a18 100%);
+      color: var(--mf-text);
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    .font-mono { font-family: "Cascadia Code", "Fira Code", Consolas, monospace; }
+    .glass {
+      background: var(--mf-panel-bg);
+      backdrop-filter: blur(14px);
+      border: 1px solid var(--mf-border);
+    }
+    .app-shell {
+      display: flex;
+      height: 100vh;
+      width: 100vw;
+      position: relative;
+    }
+    .sidebar-left {
+      width: 260px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--mf-border);
+      background: rgba(5, 10, 22, 0.85);
+    }
+    .main-stage {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      position: relative;
+    }
+    .drawer-right {
+      width: 340px;
+      flex-shrink: 0;
+      border-left: 1px solid var(--mf-border);
+      background: rgba(6, 12, 26, 0.9);
+      display: flex;
+      flex-direction: column;
+      transition: margin-right 0.22s ease, opacity 0.2s ease;
+    }
+    .drawer-right.collapsed {
+      margin-right: -340px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .channel-item {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--mf-muted);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: all 0.15s;
+    }
+    .channel-item:hover { background: rgba(0, 243, 255, 0.08); color: var(--mf-text); }
+    .channel-item.active {
+      background: rgba(0, 243, 255, 0.14);
+      border-color: rgba(0, 243, 255, 0.35);
+      color: var(--mf-cyan);
+    }
+    #messageStream {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .msg-card {
+      background: var(--mf-panel-alt);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 10px;
+      padding: 10px 14px;
+      max-width: 82%;
+    }
+    .msg-card.self {
+      align-self: flex-end;
+      border-color: rgba(0, 243, 255, 0.28);
+      background: rgba(0, 55, 80, 0.35);
+    }
+    .msg-img {
+      max-width: 320px;
+      max-height: 260px;
+      border-radius: 8px;
+      border: 1px solid var(--mf-border);
+      margin-top: 6px;
+      cursor: pointer;
+    }
+    .floating-player {
+      position: fixed;
+      top: 72px;
+      right: 365px;
+      width: 420px;
+      z-index: 1040;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.65);
+    }
+    .floating-player.minimized .player-body { display: none; }
+    .floating-header {
+      cursor: move;
+      background: rgba(8, 16, 36, 0.96);
+      border-bottom: 1px solid var(--mf-border);
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      user-select: none;
+    }
+    .emoji-popover {
+      position: absolute;
+      bottom: 74px;
+      left: 16px;
+      width: 280px;
+      padding: 10px;
+      border-radius: 10px;
+      z-index: 1050;
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 4px;
+    }
+    .emoji-btn {
+      background: transparent;
+      border: none;
+      font-size: 1.25rem;
+      padding: 4px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .emoji-btn:hover { background: rgba(255,255,255,0.12); }
+    .badge-role-admin { background: rgba(176, 38, 255, 0.25); color: #e2a8ff; border: 1px solid rgba(176, 38, 255, 0.5); }
+    .badge-role-seller { background: rgba(0, 243, 255, 0.18); color: var(--mf-cyan); border: 1px solid rgba(0, 243, 255, 0.4); }
+    .pulse-rec { animation: pulseRec 1.2s infinite; color: #ff4d6d !important; }
+    @keyframes pulseRec { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Left Sidebar -->
+    <aside class="sidebar-left p-3">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <div>
+          <div class="fw-bold text-info font-mono">MATEFLOW // SANDBOX</div>
+          <small class="text-secondary font-mono" id="connStatus">CONNECTING...</small>
+        </div>
+        <button class="btn btn-sm btn-outline-info" id="btnSettings" title="Auth / Identity"><i class="bi bi-key"></i></button>
+      </div>
+
+      <div class="p-2 rounded glass mb-3">
+        <div class="d-flex align-items-center justify-content-between">
+          <span class="fw-semibold" id="selfName">guest</span>
+          <span class="badge font-mono" id="selfRoleBadge">seller</span>
+        </div>
+        <button class="btn btn-xs btn-outline-secondary w-100 mt-2 py-1" style="font-size:0.75rem" id="btnMySellerRoom">
+          <i class="bi bi-shop me-1"></i>Open My Seller Room
+        </button>
+      </div>
+
+      <div class="text-uppercase text-secondary font-mono mb-2" style="font-size:0.72rem">Rooms & Channels</div>
+      <div id="roomList" class="d-flex flex-column gap-1 mb-3 overflow-auto" style="max-height: 36vh;"></div>
+
+      <div class="text-uppercase text-secondary font-mono mb-2" style="font-size:0.72rem">Online in Room</div>
+      <div id="onlineList" class="d-flex flex-wrap gap-1 mb-auto"></div>
+
+      <div class="pt-2 border-top border-secondary-subtle mt-2 d-flex gap-2">
+        <button class="btn btn-sm btn-outline-info flex-grow-1" id="btnTogglePlayer">
+          <i class="bi bi-play-btn me-1"></i>Player
+        </button>
+        <button class="btn btn-sm btn-outline-light" id="btnToggleDrawer" title="Inventory & Giveaways">
+          <i class="bi bi-layout-sidebar-reverse"></i>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Chat Stage -->
+    <main class="main-stage">
+      <header class="glass px-3 py-2 d-flex align-items-center justify-content-between" style="border-top:0;border-left:0;border-right:0;">
+        <div class="d-flex align-items-center gap-2">
+          <span class="fw-bold fs-5 text-info font-mono" id="activeRoomTitle">#main-comms</span>
+          <span class="badge bg-dark border border-info-subtle font-mono" id="audioPolicyBadge">AUDIO: STT ONLY</span>
+          <span class="badge bg-dark border border-secondary font-mono" id="followerBadge">0 followers</span>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <!-- Host Audio Toggle -->
+          <button class="btn btn-sm btn-outline-warning d-none" id="btnHostAudioToggle">
+            <i class="bi bi-mic-fill me-1"></i><span>Enable Live Audio</span>
+          </button>
+          <button class="btn btn-sm btn-outline-info" id="btnFollowRoom">
+            <i class="bi bi-heart me-1"></i><span>Follow (1 Entry)</span>
+          </button>
+          <button class="btn btn-sm btn-outline-secondary" id="btnDrawerHeaderToggle">
+            <i class="bi bi-bag me-1"></i>Shop / Giveaway
+          </button>
+        </div>
+      </header>
+
+      <!-- Active Giveaway Banner -->
+      <div id="giveawayBanner" class="px-3 py-2 bg-dark border-bottom border-info-subtle d-none align-items-center justify-content-between">
+        <div class="font-mono small">
+          <i class="bi bi-gift-fill text-warning me-2"></i>
+          <span id="giveawayBannerText" class="text-light">Giveaway Active</span>
+        </div>
+        <span class="badge bg-warning text-dark font-mono" id="giveawayEntryCount">0 entries</span>
+      </div>
+
+      <!-- Messages -->
+      <div id="messageStream"></div>
+
+      <!-- Emoji Popover -->
+      <div id="emojiPopover" class="glass emoji-popover d-none"></div>
+
+      <!-- Composer -->
+      <footer class="glass p-2 m-2 rounded-3 position-relative" id="dropZone">
+        <form id="messageForm" class="d-flex align-items-center gap-2">
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="btnEmoji" title="Emojis"><i class="bi bi-emoji-smile"></i></button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="btnUpload" title="Upload JPEG/PNG/GIF (File-Scan Gateway)"><i class="bi bi-image"></i></button>
+          <input type="file" id="fileInput" accept="image/jpeg,image/png,image/gif" class="d-none" />
+          <button type="button" class="btn btn-sm btn-outline-info" id="btnMic" title="Voice (Live if Host enabled, else Speech-to-Text)">
+            <i class="bi bi-mic"></i>
+          </button>
+          <input type="text" id="messageInput" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Message room, paste image, or use mic..." autocomplete="off" />
+          <button type="submit" class="btn btn-sm btn-info fw-semibold px-3">Send</button>
+        </form>
+        <div class="d-flex justify-content-between px-1 pt-1 text-secondary font-mono" style="font-size:0.7rem">
+          <span id="telemetryLeft">READY</span>
+          <span id="telemetryRight">GATEWAY: CLAMAV + RE-ENCODE</span>
+        </div>
+      </footer>
+    </main>
+
+    <!-- Collapsible Right Drawer: Room Inventory & Giveaways -->
+    <aside class="drawer-right" id="rightDrawer">
+      <div class="p-2 border-bottom border-info-subtle d-flex align-items-center justify-content-between">
+        <ul class="nav nav-pills nav-fill w-100 gap-1" style="font-size:0.82rem">
+          <li class="nav-item">
+            <button class="nav-link active py-1" id="tabInvBtn" data-tab="inv"><i class="bi bi-box-seam me-1"></i>Inventory</button>
+          </li>
+          <li class="nav-item">
+            <button class="nav-link py-1" id="tabGiveBtn" data-tab="give"><i class="bi bi-gift me-1"></i>Giveaways</button>
+          </li>
+        </ul>
+      </div>
+
+      <!-- Inventory Tab -->
+      <div id="tabInv" class="p-3 overflow-auto flex-grow-1">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <span class="font-mono small text-info">ROOM INVENTORY</span>
+          <button class="btn btn-xs btn-outline-info py-0 px-2" style="font-size:0.75rem" id="btnRefreshInv"><i class="bi bi-arrow-clockwise"></i></button>
+        </div>
+        <a id="roomStoreBtn" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-outline-success w-100 mb-2 d-none">
+          <i class="bi bi-shop-window me-1"></i>Visit Seller Store
+        </a>
+        <div id="hostStoreBox" class="input-group input-group-sm mb-2 d-none">
+          <input id="storeUrlInput" class="form-control bg-dark text-light border-secondary" placeholder="Storefront URL (https://...)" />
+          <button type="button" class="btn btn-outline-info flex-shrink-0" id="btnSaveStoreUrl">Save</button>
+        </div>
+          <div id="storeSaveStatus" class="small mt-1 text-info d-none"></div>
+        <div id="inventoryList" class="d-flex flex-column gap-2 mb-3"></div>
+
+        <!-- Add Item (Host/Seller) -->
+        <div id="addInvBox" class="p-2 rounded glass mt-2 d-none">
+          <div class="font-mono small text-secondary mb-2">ADD ROOM ITEM</div>
+          <input id="invTitle" class="form-control form-control-sm mb-1 bg-dark text-light" placeholder="Item title" />
+          <div class="d-flex gap-1 mb-1">
+            <input id="invPrice" type="number" step="0.01" class="form-control form-control-sm bg-dark text-light" placeholder="Price" />
+            <input id="invQty" type="number" class="form-control form-control-sm bg-dark text-light" placeholder="Qty" value="1" />
+          </div>
+          <input id="invUrl" class="form-control form-control-sm mb-1 bg-dark text-light" placeholder="Product / Checkout URL (https://...)" />
+          <button id="btnAddInv" class="btn btn-sm btn-outline-info w-100">Add to Room</button>
+        </div>
+      </div>
+
+      <!-- Giveaway Tab -->
+      <div id="tabGive" class="p-3 overflow-auto flex-grow-1 d-none">
+        <div class="p-3 rounded glass mb-3">
+          <div class="font-mono small text-warning mb-1"><i class="bi bi-trophy me-1"></i>FOLLOW = 1 ENTRY</div>
+          <div id="giveawayStatusText" class="small text-light mb-2">No active giveaway.</div>
+          <div id="giveawayWinnerBox" class="alert alert-success py-1 px-2 small d-none"></div>
+          <button id="btnDrawerFollow" class="btn btn-sm btn-info w-100 mb-2">Follow Seller & Enter</button>
+          <div class="small text-secondary font-mono" id="giveawayEntriesList"></div>
+        </div>
+
+        <div id="hostGiveawayControls" class="p-2 rounded glass d-none">
+          <div class="font-mono small text-secondary mb-2">HOST GIVEAWAY CONTROLS</div>
+          <input id="giveawayTitleInput" class="form-control form-control-sm mb-2 bg-dark text-light" placeholder="Prize title (e.g. Mystery Slab)" />
+          <div class="d-flex gap-2">
+            <button id="btnStartGiveaway" class="btn btn-sm btn-outline-warning flex-grow-1">Start</button>
+            <button id="btnDrawGiveaway" class="btn btn-sm btn-success flex-grow-1">Draw Winner</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Floating Player ("BoysTown Live" / Watch a Movie Together) -->
+  <div id="floatingPlayer" class="floating-player glass">
+    <div class="floating-header" id="floatingHeader">
+      <div class="d-flex align-items-center gap-2">
+        <span class="badge bg-danger font-mono">LIVE</span>
+        <span class="font-mono small text-info" id="playerRoomLabel">BoysTown Live</span>
+      </div>
+      <div class="d-flex gap-1">
+        <button class="btn btn-xs btn-outline-secondary py-0 px-1" id="btnMinPlayer" title="Minimize"><i class="bi bi-dash"></i></button>
+        <button class="btn btn-xs btn-outline-secondary py-0 px-1" id="btnClosePlayer" title="Hide"><i class="bi bi-x"></i></button>
+      </div>
+    </div>
+    <div class="player-body bg-black">
+      <video id="syncVideo" class="w-100" style="max-height:240px;background:#000" controls playsinline></video>
+      <div id="hostVideoControls" class="p-2 border-top border-info-subtle bg-dark d-none">
+        <div class="input-group input-group-sm mb-1">
+          <input id="videoUrlInput" class="form-control bg-black text-light border-secondary" placeholder="MP4 / WebM URL to Watch Together" />
+          <button class="btn btn-outline-info" id="btnLoadVideo">Load</button>
+        </div>
+        <div class="d-flex gap-1">
+          <button class="btn btn-xs btn-outline-success flex-grow-1 py-0" id="btnHostPlay"><i class="bi bi-play-fill"></i> Sync Play</button>
+          <button class="btn btn-xs btn-outline-warning flex-grow-1 py-0" id="btnHostPause"><i class="bi bi-pause-fill"></i> Sync Pause</button>
+        </div>
+      </div>
+      <div id="remoteAudioContainer" class="d-none"></div>
+    </div>
+  </div>
+
+  <!-- Auth Modal -->
+  <div class="modal fade" id="authModal" data-bs-backdrop="static" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <form id="authForm" class="modal-content glass text-light">
+        <div class="modal-header border-secondary">
+          <h5 class="modal-title font-mono text-info">MATEFLOW // ACCESS KEY</h5>
+        </div>
+        <div class="modal-body">
+          <div id="authError" class="alert alert-danger py-1 small d-none">Invalid key.</div>
+          <label class="form-label small font-mono">Bearer Key</label>
+          <input id="inputKey" type="password" class="form-control bg-dark text-light border-secondary" required />
+        </div>
+        <div class="modal-footer border-secondary">
+          <button type="submit" class="btn btn-info fw-semibold w-100">Connect</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    (() => {
+      const STORAGE_KEY = "mfchat_key";
+      let apiKey = localStorage.getItem(STORAGE_KEY) || "";
+      let me = { name: "guest", role: "seller" };
+      let activeRoom = "main";
+      let roomState = null;
+      let lastId = 0;
+      let ws = null;
+      let localStream = null;
+      let peers = {};
+      let sttRecognition = null;
+      let isMicActive = false;
+
+      const authModal = new bootstrap.Modal(document.getElementById("authModal"));
+      const streamEl = document.getElementById("messageStream");
+      const syncVideo = document.getElementById("syncVideo");
+      const EMOJIS = ["\u{1F525}","\u{1F680}","\u{1F4B0}","\u{1F389}","\u{1F44D}","\u{2764}\u{FE0F}","\u{1F602}","\u{1F60E}","\u{1F4AF}","\u{26A1}","\u{1F3AC}","\u{1F3A4}","\u{1F6D2}","\u{1F3F7}\u{FE0F}","\u{1F4E6}","\u{2705}","\u{1F440}","\u{1F64C}","\u{1F91D}","\u{1F48E}","\u{1F3C6}"];
+
+      function hdr(json = true) {
+        const h = { "Authorization": "Bearer " + apiKey };
+        if (json) h["Content-Type"] = "application/json";
+        return h;
+      }
+
+      function canHost() {
+        return me.role === "admin" || (roomState && roomState.owner === me.name);
+      }
+
+      async function api(url, opts = {}) {
+        const res = await fetch(url, opts);
+        if (res.status === 401) {
+          localStorage.removeItem(STORAGE_KEY);
+          document.getElementById("authError").classList.remove("d-none");
+          authModal.show();
+          throw new Error("unauthorized");
+        }
+        if (!res.ok) throw new Error(await res.text() || ("HTTP " + res.status));
+        return res.json();
+      }
+
+      // Emoji picker setup
+      const emojiPop = document.getElementById("emojiPopover");
+      EMOJIS.forEach(em => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "emoji-btn";
+        b.textContent = em;
+        b.onclick = () => {
+          const inp = document.getElementById("messageInput");
+          inp.value += em;
+          inp.focus();
+          emojiPop.classList.add("d-none");
+        };
+        emojiPop.appendChild(b);
+      });
+      document.getElementById("btnEmoji").onclick = () => emojiPop.classList.toggle("d-none");
+
+      // Draggable Floating Player
+      (() => {
+        const box = document.getElementById("floatingPlayer");
+        const hdrEl = document.getElementById("floatingHeader");
+        let dx = 0, dy = 0, dragging = false;
+        hdrEl.onmousedown = (e) => {
+          if (e.target.closest("button")) return;
+          dragging = true;
+          dx = e.clientX - box.offsetLeft;
+          dy = e.clientY - box.offsetTop;
+        };
+        window.onmousemove = (e) => {
+          if (!dragging) return;
+          box.style.left = Math.max(0, e.clientX - dx) + "px";
+          box.style.top = Math.max(0, e.clientY - dy) + "px";
+          box.style.right = "auto";
+        };
+        window.onmouseup = () => { dragging = false; };
+      })();
+
+      document.getElementById("btnMinPlayer").onclick = () => document.getElementById("floatingPlayer").classList.toggle("minimized");
+      document.getElementById("btnClosePlayer").onclick = () => document.getElementById("floatingPlayer").classList.add("d-none");
+      document.getElementById("btnTogglePlayer").onclick = () => document.getElementById("floatingPlayer").classList.toggle("d-none");
+
+      function toggleDrawer() {
+        document.getElementById("rightDrawer").classList.toggle("collapsed");
+      }
+      document.getElementById("btnToggleDrawer").onclick = toggleDrawer;
+      document.getElementById("btnDrawerHeaderToggle").onclick = toggleDrawer;
+
+      document.querySelectorAll("[data-tab]").forEach(btn => {
+        btn.onclick = () => {
+          document.querySelectorAll("[data-tab]").forEach(b => b.classList.remove("active"));
+          btn.classList.add("active");
+          document.getElementById("tabInv").classList.toggle("d-none", btn.dataset.tab !== "inv");
+          document.getElementById("tabGive").classList.toggle("d-none", btn.dataset.tab !== "give");
+        };
+      });
+
+      function appendMessage(m) {
+        if (m.id && m.id <= lastId) return;
+        if (m.id) lastId = m.id;
+        const card = document.createElement("div");
+        card.className = "msg-card" + (m.from === me.name ? " self" : "");
+        const top = document.createElement("div");
+        top.className = "d-flex align-items-center gap-2 mb-1";
+        const nameEl = document.createElement("span");
+        nameEl.className = "fw-bold text-info small";
+        nameEl.textContent = m.from;
+        top.appendChild(nameEl);
+        if (m.role) {
+          const rb = document.createElement("span");
+          rb.className = "badge font-mono " + (m.role === "admin" ? "badge-role-admin" : "badge-role-seller");
+          rb.style.fontSize = "0.65rem";
+          rb.textContent = m.role;
+          top.appendChild(rb);
+        }
+        if (m.stt) {
+          const sb = document.createElement("span");
+          sb.className = "badge bg-secondary font-mono";
+          sb.style.fontSize = "0.62rem";
+          sb.textContent = "STT";
+          top.appendChild(sb);
+        }
+        const timeEl = document.createElement("span");
+        timeEl.className = "text-secondary font-mono ms-auto";
+        timeEl.style.fontSize = "0.68rem";
+        timeEl.textContent = m.at ? new Date(m.at).toLocaleTimeString([], { hour12: false }) : "";
+        top.appendChild(timeEl);
+        card.appendChild(top);
+
+        if (m.text) {
+          const body = document.createElement("div");
+          body.className = "small";
+          body.style.whiteSpace = "pre-wrap";
+          body.textContent = m.text;
+          card.appendChild(body);
+        }
+        if (m.media_url) {
+          const img = document.createElement("img");
+          img.src = m.media_url;
+          img.className = "msg-img d-block";
+          img.onclick = () => window.open(m.media_url, "_blank");
+          card.appendChild(img);
+        }
+        if (m.pinned_item) {
+          const box = document.createElement("div");
+          box.className = "mt-2 p-2 rounded border border-info-subtle bg-dark small";
+          const linkHtml = (m.pinned_item.url && /^https?:\/\//i.test(m.pinned_item.url))
+            ? `<a href="${m.pinned_item.url}" target="_blank" rel="noopener noreferrer" class="btn btn-xs btn-success py-0 px-2 mt-1">View / Buy <i class="bi bi-box-arrow-up-right ms-1"></i></a>`
+            : "";
+          box.innerHTML = `<div class="fw-bold text-info"><i class="bi bi-pin-angle-fill me-1"></i>${m.pinned_item.title}</div>
+            <div class="font-mono text-success">$${Number(m.pinned_item.price).toFixed(2)} ? Qty: ${m.pinned_item.quantity}</div>${linkHtml}`;
+          card.appendChild(box);
+        }
+        streamEl.appendChild(card);
+        streamEl.scrollTop = streamEl.scrollHeight;
+      }
+
+      function applyRoomState(rs) {
+        roomState = rs;
+        document.getElementById("activeRoomTitle").textContent = rs.title || rs.id;
+        document.getElementById("playerRoomLabel").textContent = rs.title || rs.id;
+        document.getElementById("followerBadge").textContent = `${rs.follower_count || 0} followers`;
+
+        const audioBadge = document.getElementById("audioPolicyBadge");
+        const isLive = rs.audio_mode === "live";
+        audioBadge.textContent = isLive ? "AUDIO: LIVE MIC" : "AUDIO: STT ONLY";
+        audioBadge.className = "badge font-mono " + (isLive ? "bg-success" : "bg-dark border border-info-subtle");
+
+        const followBtn = document.getElementById("btnFollowRoom");
+        followBtn.innerHTML = rs.followed_by_me ? '<i class="bi bi-heart-fill text-danger me-1"></i>Followed (Entered)' : '<i class="bi bi-heart me-1"></i>Follow (1 Entry)';
+
+        // Host controls visibility
+        const host = canHost();
+        document.getElementById("btnHostAudioToggle").classList.toggle("d-none", !host);
+        document.getElementById("btnHostAudioToggle").querySelector("span").textContent = isLive ? "Switch to STT-Only" : "Enable Live Audio";
+        document.getElementById("hostVideoControls").classList.toggle("d-none", !host);
+        document.getElementById("hostGiveawayControls").classList.toggle("d-none", !host);
+        document.getElementById("addInvBox").classList.toggle("d-none", !(host || me.role === "seller"));
+        document.getElementById("hostStoreBox").classList.toggle("d-none", !host);
+        const sui = document.getElementById("storeUrlInput"); if (sui && document.activeElement !== sui) sui.value = rs.store_url || "";
+        const storeBtn = document.getElementById("roomStoreBtn");
+        if (rs.store_url && /^https?:\/\//i.test(rs.store_url)) {
+          storeBtn.href = rs.store_url;
+          storeBtn.classList.remove("d-none");
+        } else {
+          storeBtn.classList.add("d-none");
+        }
+
+        // Online badges
+        const onlineEl = document.getElementById("onlineList");
+        onlineEl.innerHTML = "";
+        (rs.online || []).forEach(u => {
+          const sp = document.createElement("span");
+          sp.className = "badge bg-dark border border-info-subtle font-mono";
+          sp.textContent = u;
+          onlineEl.appendChild(sp);
+        });
+
+        // Video sync
+        if (rs.video && rs.video.url) {
+          if (syncVideo.dataset.src !== rs.video.url) {
+            syncVideo.dataset.src = rs.video.url;
+            syncVideo.src = rs.video.url;
+            document.getElementById("videoUrlInput").value = rs.video.url;
+          }
+          const drift = rs.video.playing ? (Date.now() - rs.video.updated_at) / 1000 : 0;
+          const target = Math.max(0, (rs.video.position || 0) + drift);
+          if (Math.abs((syncVideo.currentTime || 0) - target) > 1.8) {
+            syncVideo.currentTime = target;
+          }
+          if (rs.video.playing && syncVideo.paused) syncVideo.play().catch(() => {});
+          if (!rs.video.playing && !syncVideo.paused) syncVideo.pause();
+        }
+
+        // Giveaway UI
+        const gw = rs.giveaway || {};
+        const banner = document.getElementById("giveawayBanner");
+        if (gw.active) {
+          banner.classList.remove("d-none");
+          banner.classList.add("d-flex");
+          document.getElementById("giveawayBannerText").textContent = `GIVEAWAY: ${gw.title} ? Follow seller for 1 entry!`;
+          document.getElementById("giveawayEntryCount").textContent = `${(gw.entries || []).length} entries`;
+          document.getElementById("giveawayStatusText").textContent = `Active: ${gw.title} (${(gw.entries || []).length} entries)`;
+        } else {
+          banner.classList.add("d-none");
+          banner.classList.remove("d-flex");
+          document.getElementById("giveawayStatusText").textContent = "No active giveaway right now.";
+        }
+        const winBox = document.getElementById("giveawayWinnerBox");
+        if (gw.winner) {
+          winBox.classList.remove("d-none");
+          winBox.textContent = `Winner: ${gw.winner}!`;
+        } else {
+          winBox.classList.add("d-none");
+        }
+        document.getElementById("giveawayEntriesList").textContent = (gw.entries && gw.entries.length) ? ("Entries: " + gw.entries.join(", ")) : "";
+      }
+
+      async function loadRooms() {
+        const list = await api("/api/rooms", { headers: hdr(false) });
+        const el = document.getElementById("roomList");
+        el.innerHTML = "";
+        list.sort((a, b) => a.id.localeCompare(b.id)).forEach(r => {
+          const btn = document.createElement("button");
+          btn.className = "channel-item" + (r.id === activeRoom ? " active" : "");
+          btn.innerHTML = `<span>${r.title || r.id}</span><span class="badge bg-dark font-mono">${(r.online || []).length}</span>`;
+          btn.onclick = () => switchRoom(r.id);
+          el.appendChild(btn);
+        });
+      }
+
+      async function loadInventory() {
+        const items = await api("/api/inventory?room=" + encodeURIComponent(activeRoom), { headers: hdr(false) });
+        const el = document.getElementById("inventoryList");
+        el.innerHTML = "";
+        if (!items.length) {
+          el.innerHTML = '<div class="small text-secondary">No items in this room yet.</div>';
+          return;
+        }
+        items.forEach(it => {
+          const card = document.createElement("div");
+          card.className = "p-2 rounded glass";
+          card.innerHTML = `
+            <div class="d-flex justify-content-between align-items-start">
+              <div class="fw-semibold small text-light">${it.title}</div>
+              <span class="badge bg-success font-mono">$${Number(it.price).toFixed(2)}</span>
+            </div>
+            <div class="text-secondary font-mono mt-1" style="font-size:0.72rem">Qty: ${it.quantity} ? ${it.condition || "NEW"}</div>
+            <div class="d-flex gap-1 mt-2">
+              <button class="btn btn-xs btn-outline-info flex-grow-1 py-0 pin-btn">Pin to Chat</button>
+              ${(it.url && /^https?:\/\//i.test(it.url)) ? `<a href="${it.url}" target="_blank" rel="noopener noreferrer" class="btn btn-xs btn-success py-0 px-2">Buy / Link</a>` : ""}
+            </div>`;
+          card.querySelector(".pin-btn").onclick = async () => {
+            await api("/api/messages", {
+              method: "POST",
+              headers: hdr(),
+              body: JSON.stringify({ room: activeRoom, text: `Pinned item: ${it.title}`, pinned_item: it })
+            });
+          };
+          el.appendChild(card);
+        });
+      }
+
+      function connectWS() {
+        if (ws) ws.close();
+        const proto = location.protocol === "https:" ? "wss://" : "ws://";
+        ws = new WebSocket(`${proto}${location.host}/ws?room=${encodeURIComponent(activeRoom)}&token=${encodeURIComponent(apiKey)}`);
+        ws.onopen = () => { document.getElementById("connStatus").textContent = "WS // ONLINE"; };
+        ws.onclose = () => { document.getElementById("connStatus").textContent = "WS // RECONNECTING"; setTimeout(connectWS, 2500); };
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "chat") appendMessage(msg.data);
+          if (msg.type === "room_state") applyRoomState(msg.data);
+          if (msg.type === "rtc_signal") handleRTCSignal(msg.from, msg.data);
+        };
+      }
+
+      async function switchRoom(roomId) {
+        activeRoom = roomId;
+        lastId = 0;
+        streamEl.innerHTML = "";
+        stopMic();
+        await loadRooms();
+        const msgs = await api(`/api/messages?room=${encodeURIComponent(activeRoom)}&since=0`, { headers: hdr(false) });
+        msgs.forEach(appendMessage);
+        const rs = await api(`/api/rooms/state?room=${encodeURIComponent(activeRoom)}`, { headers: hdr(false) });
+        applyRoomState(rs);
+        await loadInventory();
+        connectWS();
+      }
+
+      // File-Scan Upload Gateway (JPEG/PNG/GIF)
+      async function uploadFile(file) {
+        if (!file) return;
+        const tel = document.getElementById("telemetryLeft");
+        tel.textContent = "SCANNING VIA CLAMAV GATEWAY...";
+        const fd = new FormData();
+        fd.append("file", file);
+        try {
+          const res = await api("/api/upload", { method: "POST", headers: hdr(false), body: fd });
+          tel.textContent = `CLEAN (${res.scan}) // POSTING MEDIA`;
+          await api("/api/messages", {
+            method: "POST",
+            headers: hdr(),
+            body: JSON.stringify({ room: activeRoom, text: "", media_url: res.url, media_type: res.mime })
+          });
+          tel.textContent = "READY";
+        } catch (err) {
+          tel.textContent = "UPLOAD BLOCKED: " + err.message;
+        }
+      }
+
+      document.getElementById("btnUpload").onclick = () => document.getElementById("fileInput").click();
+      document.getElementById("fileInput").onchange = (e) => uploadFile(e.target.files[0]);
+      document.getElementById("messageInput").addEventListener("paste", (e) => {
+        const item = Array.from(e.clipboardData?.items || []).find(i => i.type.startsWith("image/"));
+        if (item) uploadFile(item.getAsFile());
+      });
+
+      // Audio Policy: Host Live Audio (WebRTC) vs Speech-to-Text Fallback
+      async function handleRTCSignal(from, data) {
+        if (!roomState || roomState.audio_mode !== "live") return;
+        let pc = peers[from];
+        if (!pc) {
+          pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+          peers[from] = pc;
+          pc.onicecandidate = (e) => {
+            if (e.candidate && ws) ws.send(JSON.stringify({ type: "rtc_signal", to: from, data: { candidate: e.candidate } }));
+          };
+          pc.ontrack = (e) => {
+            let a = document.getElementById("audio-" + from);
+            if (!a) {
+              a = document.createElement("audio");
+              a.id = "audio-" + from;
+              a.autoplay = true;
+              document.getElementById("remoteAudioContainer").appendChild(a);
+            }
+            a.srcObject = e.streams[0];
+          };
+          if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+        }
+        if (data.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          if (data.sdp.type === "offer") {
+            const ans = await pc.createAnswer();
+            await pc.setLocalDescription(ans);
+            ws.send(JSON.stringify({ type: "rtc_signal", to: from, data: { sdp: pc.localDescription } }));
+          }
+        } else if (data.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
+        }
+      }
+
+      function stopMic() {
+        isMicActive = false;
+        document.getElementById("btnMic").classList.remove("pulse-rec");
+        if (sttRecognition) { try { sttRecognition.stop(); } catch {} sttRecognition = null; }
+        if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+        Object.values(peers).forEach(p => p.close());
+        peers = {};
+      }
+
+      document.getElementById("btnMic").onclick = async () => {
+        if (isMicActive) { stopMic(); return; }
+        isMicActive = true;
+        document.getElementById("btnMic").classList.add("pulse-rec");
+
+        if (roomState && roomState.audio_mode === "live") {
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            (roomState.online || []).filter(u => u !== me.name).forEach(async peerName => {
+              const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+              peers[peerName] = pc;
+              localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+              pc.onicecandidate = (e) => {
+                if (e.candidate && ws) ws.send(JSON.stringify({ type: "rtc_signal", to: peerName, data: { candidate: e.candidate } }));
+              };
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              ws.send(JSON.stringify({ type: "rtc_signal", to: peerName, data: { sdp: pc.localDescription } }));
+            });
+            document.getElementById("telemetryLeft").textContent = "LIVE AUDIO STREAMING";
+          } catch (err) {
+            stopMic();
+            document.getElementById("telemetryLeft").textContent = "MIC ERROR: " + err.message;
+          }
+        } else {
+          const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (!SR) {
+            stopMic();
+            alert("Speech-to-Text not supported in this browser (try Chrome/Edge).");
+            return;
+          }
+          sttRecognition = new SR();
+          sttRecognition.continuous = true;
+          sttRecognition.interimResults = false;
+          sttRecognition.onresult = async (ev) => {
+            const transcript = ev.results[ev.results.length - 1][0].transcript.trim();
+            if (transcript) {
+              await api("/api/messages", {
+                method: "POST",
+                headers: hdr(),
+                body: JSON.stringify({ room: activeRoom, text: transcript, stt: true })
+              });
+            }
+          };
+          sttRecognition.onend = () => { if (isMicActive) sttRecognition.start(); };
+          sttRecognition.start();
+          document.getElementById("telemetryLeft").textContent = "STT ACTIVE (HOST DISABLED LIVE AUDIO)";
+        }
+      };
+
+      // Form & Button Handlers
+      document.getElementById("messageForm").onsubmit = async (e) => {
+        e.preventDefault();
+        const inp = document.getElementById("messageInput");
+        const text = inp.value.trim();
+        if (!text) return;
+        inp.value = "";
+        await api("/api/messages", {
+          method: "POST",
+          headers: hdr(),
+          body: JSON.stringify({ room: activeRoom, text })
+        });
+      };
+
+      document.getElementById("btnHostAudioToggle").onclick = async () => {
+        const next = roomState?.audio_mode === "live" ? "stt_only" : "live";
+        await api(`/api/rooms/audio?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ audio_mode: next })
+        });
+      };
+
+      async function followRoom() {
+        await api(`/api/rooms/follow?room=${encodeURIComponent(activeRoom)}`, { method: "POST", headers: hdr() });
+      }
+      document.getElementById("btnFollowRoom").onclick = followRoom;
+      document.getElementById("btnDrawerFollow").onclick = followRoom;
+
+      document.getElementById("btnStartGiveaway").onclick = async () => {
+        const title = document.getElementById("giveawayTitleInput").value.trim();
+        await api(`/api/rooms/giveaway?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "start", title })
+        });
+      };
+      document.getElementById("btnDrawGiveaway").onclick = async () => {
+        await api(`/api/rooms/giveaway?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "draw" })
+        });
+      };
+
+      document.getElementById("btnLoadVideo").onclick = async () => {
+        const url = document.getElementById("videoUrlInput").value.trim();
+        await api(`/api/rooms/video?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "load", url })
+        });
+      };
+      document.getElementById("btnHostPlay").onclick = async () => {
+        await api(`/api/rooms/video?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "play", url: document.getElementById("videoUrlInput").value.trim(), position: syncVideo.currentTime || 0 })
+        });
+      };
+      document.getElementById("btnHostPause").onclick = async () => {
+        await api(`/api/rooms/video?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "pause", position: syncVideo.currentTime || 0 })
+        });
+      };
+
+      document.getElementById("btnRefreshInv").onclick = loadInventory;
+            const btnSaveStore = document.getElementById("btnSaveStoreUrl");
+      if (btnSaveStore) btnSaveStore.onclick = async () => {
+        const stEl = document.getElementById("storeSaveStatus");
+        const nameEl = document.getElementById("storeNameInput");
+        const urlEl = document.getElementById("storeUrlInput");
+        const store_name = nameEl ? nameEl.value.trim() : "";
+        let store_url = urlEl ? urlEl.value.trim() : "";
+        if (store_url && !/^https?:\/\//i.test(store_url)) {
+          store_url = "https://" + store_url;
+          if (urlEl) urlEl.value = store_url;
+        }
+        try {
+          const res = await api(`/api/rooms/store?room=${encodeURIComponent(activeRoom)}`, {
+            method: "POST", headers: hdr(), body: JSON.stringify({ store_name, store_url })
+          });
+          if (stEl) {
+            stEl.textContent = "Saved!";
+            stEl.className = "small mt-1 text-success";
+            stEl.classList.remove("d-none");
+            setTimeout(() => stEl.classList.add("d-none"), 2500);
+          }
+        } catch (err) {
+          if (stEl) {
+            stEl.textContent = "Save failed: " + (err.message || err);
+            stEl.className = "small mt-1 text-danger";
+            stEl.classList.remove("d-none");
+          }
+        }
+      };
+
+      document.getElementById("btnAddInv").onclick = async () => {
+        const title = document.getElementById("invTitle").value.trim();
+        const price = parseFloat(document.getElementById("invPrice").value || "0");
+        const quantity = parseInt(document.getElementById("invQty").value || "1", 10);
+        const url = document.getElementById("invUrl").value.trim();
+        if (!title) return;
+        await api(`/api/inventory?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ room: activeRoom, title, price, quantity, condition: "NEW", url })
+        });
+        document.getElementById("invTitle").value = "";
+        document.getElementById("invUrl").value = "";
+        await loadInventory();
+      };
+
+      document.getElementById("btnMySellerRoom").onclick = async () => {
+        const id = "seller:" + me.name;
+        await api("/api/rooms", { method: "POST", headers: hdr(), body: JSON.stringify({ id, title: "Seller // " + me.name }) });
+        await switchRoom(id);
+      };
+
+      document.getElementById("btnSettings").onclick = () => {
+        document.getElementById("inputKey").value = apiKey;
+        authModal.show();
+      };
+      document.getElementById("authForm").onsubmit = async (e) => {
+        e.preventDefault();
+        apiKey = document.getElementById("inputKey").value.trim();
+        localStorage.setItem(STORAGE_KEY, apiKey);
+        authModal.hide();
+        await boot();
+      };
+
+      async function boot() {
+        me = await api("/api/me", { headers: hdr(false) });
+        document.getElementById("selfName").textContent = me.name;
+        const rb = document.getElementById("selfRoleBadge");
+        rb.textContent = me.role;
+        rb.className = "badge font-mono " + (me.role === "admin" ? "badge-role-admin" : "badge-role-seller");
+        await switchRoom(activeRoom);
+      }
+
+      if (!apiKey) authModal.show();
+      else boot().catch(() => {});
+    })();
+  </script>
+</body>
+</html>
+
+===== FILE: mateflow-dark-theme.css =====
+:root {
+  --mf-accent: #00C49F;
+  --mf-accent-bright: #00FFD1;
+  --mf-accent-dim: #1D6A63;
+  --mf-bg: #060B0A;
+  --mf-bg-deep: #030706;
+  --mf-surface: #0D1413;
+  --mf-surface-1: #121A19;
+  --mf-surface-2: #172220;
+  --mf-surface-3: #1E2B29;
+  --mf-glass-hex: #0D1615;
+  --mf-text: #E1EBE8;
+  --mf-text-dim: #9AA9A6;
+  --mf-primary: #9CD1C9;
+  --mf-primary-container: #265B55;
+  --mf-on-primary-container: #B8EEE6;
+  --mf-on-primary: #0F4843;
+  --mf-secondary: #B1CCC8;
+  --mf-outline: #657572;
+  --mf-outline-variant: #2F3D3A;
+  --mf-glass-bg: rgba(13, 22, 21, 0.90);
+  --mf-glass-blur: 12px;
+  --mf-holo-bg: rgba(13, 23, 22, 0.65);
+  --mf-holo-blur: 20px;
+  --mf-holo-border: rgba(0, 196, 159, 0.40);
+  --mf-holo-border-hover: rgba(0, 255, 209, 0.85);
+  --mf-l-primary: #1D6A63;
+  --mf-l-on-primary: #FFFFFF;
+  --mf-l-primary-container: #A8F0E7;
+  --mf-l-on-primary-container: #045C56;
+  --mf-l-secondary: #4A6460;
+  --mf-l-on-secondary: #FFFFFF;
+  --mf-l-surface: #FAFCFB;
+  --mf-l-surface-1: #F0F5F3;
+  --mf-l-surface-2: #E8F0ED;
+  --mf-l-surface-3: #DFEAE6;
+  --mf-l-text: #111C1A;
+  --mf-l-text-dim: #4C5B58;
+  --mf-l-outline: #70807D;
+  --mf-l-outline-variant: #C5D3D0;
+  --mf-radius-sm: 6px;
+  --mf-radius: 8px;
+  --mf-radius-md: 12px;
+  --mf-radius-lg: 16px;
+  --mf-radius-xl: 24px;
+  --mf-radius-full: 9999px;
+  --mf-space-xs: 4px;
+  --mf-space-sm: 8px;
+  --mf-space-md: 16px;
+  --mf-space-lg: 24px;
+  --mf-space-xl: 32px;
+  --mf-space-2xl: 48px;
+  --mf-space-3xl: 64px;
+  --mf-space-4xl: 96px;
+  --mf-font-display: "Alata", sans-serif;
+  --mf-font-body: "Instrument Sans", sans-serif;
+  --mf-font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --mf-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --mf-shadow-card: 0 14px 28px rgba(0, 0, 0, 0.60);
+  --mf-shadow-holo: 0 20px 40px rgba(0, 0, 0, 0.70), 0 0 35px -5px rgba(0, 196, 159, 0.30), inset 0 0 20px rgba(0, 196, 159, 0.15);
+  --mf-shadow-holo-hover: 0 25px 50px rgba(0, 0, 0, 0.85), 0 0 45px rgba(0, 196, 159, 0.55), inset 0 0 25px rgba(0, 196, 159, 0.25);
+  --mf-glow-accent: 0 10px 30px -8px rgba(0, 196, 159, 0.50);
+  --mf-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --mf-ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --mf-dur-state: 150ms;
+  --mf-dur-enter: 250ms;
+}
+[data-mf-scheme="light-morning"] { --mf-bg: #FFFFFF; --mf-bg-deep: #FAFCFB; --mf-surface: #FAFCFB; --mf-surface-1: #F0F5F3; --mf-surface-2: #E8F0ED; --mf-surface-3: #DFEAE6; --mf-text: #111827; --mf-text-dim: #475569; --mf-outline: #64748B; --mf-outline-variant: #C5D3D0; --mf-accent: #E11D48; --mf-accent-bright: #F43F5E; --mf-accent-dim: #BE123C; --mf-primary: #1D6A63; --mf-font-display: "Alata", sans-serif; --mf-font-body: "Instrument Sans", sans-serif; }
+[data-mf-scheme="cyber-futuristic"] { --mf-bg: #030712; --mf-bg-deep: #02040A; --mf-accent: #E11D48; --mf-accent-bright: #00FFD1; --mf-accent-dim: #00C49F; --mf-text-dim: #9AA9A6; --mf-font-display: "Space Grotesk", sans-serif; --mf-font-body: "Instrument Sans", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="quantum-manifold"] { --mf-bg: #010208; --mf-bg-deep: #010208; --mf-accent: #FF0055; --mf-accent-bright: #00F0FF; --mf-accent-dim: #B026FF; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="quantum-lobby"] { --mf-bg: #010208; --mf-bg-deep: #010208; --mf-accent: #FF0055; --mf-accent-bright: #00F0FF; --mf-accent-dim: #B026FF; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="cobalt-sapphire"] { --mf-bg: #020617; --mf-bg-deep: #020617; --mf-accent: #0066FF; --mf-accent-bright: #00F0FF; --mf-accent-dim: #2563EB; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="polymorphic-semantic"] { --mf-bg: #020617; --mf-bg-deep: #020617; --mf-accent: #0066FF; --mf-accent-bright: #00F0FF; --mf-accent-dim: #8B5CF6; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="ultraviolet"] { --mf-bg: #05010B; --mf-bg-deep: #05010B; --mf-accent: #A855F7; --mf-accent-bright: #C084FC; --mf-accent-dim: #7E22CE; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="imperium"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #E11D48; --mf-accent-bright: #F43F5E; --mf-accent-dim: #BE123C; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="god-mode"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #E11D48; --mf-accent-bright: #F43F5E; --mf-accent-dim: #BE123C; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="god-mode-gold"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #EAB308; --mf-accent-bright: #FACC15; --mf-accent-dim: #CA8A04; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="white-brown"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #92400E; --mf-accent-bright: #B45309; --mf-accent-dim: #78350F; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="metallic-webgl"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #92400E; --mf-accent-bright: #B45309; --mf-accent-dim: #78350F; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="white-black-metallic"] { --mf-bg: #09090B; --mf-bg-deep: #09090B; --mf-surface: #111827; --mf-surface-1: #18181B; --mf-surface-2: #1F1F23; --mf-surface-3: #27272A; --mf-accent: #FFFFFF; --mf-accent-bright: #FAFAFA; --mf-accent-dim: #64748B; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+
+html, body {
+  background-color: var(--mf-bg) !important;
+  color: var(--mf-text) !important;
+  font-family: var(--mf-font-body) !important;
+  transition: background-color 0.35s ease, color 0.35s ease;
+}
+h1, h2, h3, .mf-display, .mf-h1, .mf-h2, .mf-h3 {
+  font-family: var(--mf-font-display) !important;
+}
+section, .rounded-2xl, .rounded-3xl, .feature-card, .card, .mf-holo {
+  background-color: var(--mf-surface-1) !important;
+  border-color: var(--mf-outline-variant) !important;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.65), 0 0 28px -6px var(--mf-accent) !important;
+}
+
+/* ============================================================================
+   FULL DOM & TAILWIND -> STITCH/MUSE TOKEN BRIDGE (100% SCHEME AUTHORITY)
+   ============================================================================ */
+body {
+  background-color: var(--mf-bg) !important;
+  color: var(--mf-text) !important;
+  font-family: var(--mf-font-body) !important;
+}
+h1, h2, h3, h4, .font-black, .font-extrabold {
+  font-family: var(--mf-font-display) !important;
+  letter-spacing: -0.02em;
+}
+code, pre, .font-mono {
+  font-family: var(--mf-font-mono) !important;
+}
+
+/* Override hardcoded Tailwind backgrounds & borders to obey active [data-mf-scheme] */
+.bg-slate-950, .bg-slate-950\/95, .bg-slate-950\/90 {
+  background-color: var(--mf-bg-deep) !important;
+}
+.bg-slate-900, .bg-slate-900\/95, .bg-slate-900\/90 {
+  background-color: var(--mf-surface-1) !important;
+}
+.bg-slate-800 {
+  background-color: var(--mf-surface-2) !important;
+}
+.border-slate-800, .border-slate-700, .border-slate-900 {
+  border-color: var(--mf-outline-variant) !important;
+}
+.text-slate-300, .text-slate-400, .text-slate-500 {
+  color: var(--mf-text-dim) !important;
+}
+.text-white, .text-slate-100, .text-slate-200 {
+  color: var(--mf-text) !important;
+}
+
+/* Map all primary CTAs, badges, and highlights to --mf-accent & --mf-accent-bright */
+.bg-emerald-500, .bg-emerald-600, .bg-indigo-600, .bg-amber-400 {
+  background: linear-gradient(135deg, var(--mf-accent), var(--mf-accent-bright)) !important;
+  color: #000000 !important;
+  border-color: var(--mf-accent-bright) !important;
+  box-shadow: 0 10px 28px -6px var(--mf-accent) !important;
+}
+.text-emerald-400, .text-emerald-300, .text-indigo-400, .text-indigo-300, .text-amber-400, .text-amber-300 {
+  color: var(--mf-accent-bright) !important;
+}
+.border-emerald-500, .border-emerald-500\/40, .border-emerald-500\/50, .border-emerald-500\/60,
+.border-indigo-500\/40, .border-amber-500\/40 {
+  border-color: var(--mf-accent) !important;
+}
+
+/* Infuse Stitch .mf-holo 60-degree scan-shimmer into all cards & sections */
+section, .rounded-2xl, .rounded-3xl {
+  position: relative;
+  overflow: hidden;
+  background: var(--mf-surface-1) !important;
+  border: 1px solid var(--mf-outline-variant) !important;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.70), 0 0 32px -8px var(--mf-accent), inset 0 1px 0 rgba(255, 255, 255, 0.16) !important;
+}
+.rounded-2xl::after, .rounded-3xl::after {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: linear-gradient(60deg, transparent 42%, rgba(255, 255, 255, 0.07) 50%, transparent 58%);
+  transform: rotate(25deg);
+  opacity: 0;
+  transition: opacity 0.35s ease;
+  pointer-events: none;
+}
+.rounded-2xl:hover, .rounded-3xl:hover {
+  border-color: var(--mf-accent-bright) !important;
+}
+.rounded-2xl:hover::after, .rounded-3xl:hover::after {
+  opacity: 1;
+  animation: mf-scan-shimmer 1.8s infinite;
+}
+[data-mf-scheme="futuristic-dark-synthwave"] {
+  --mf-bg: #0D0118;
+  --mf-bg-deep: #07000E;
+  --mf-surface-1: #160428;
+  --mf-surface-2: #22083B;
+  --mf-outline-variant: #4A1272;
+  --mf-accent: #FF007F;
+  --mf-accent-bright: #00F0FF;
+  --mf-btn-fg: #FFFFFF;
+  --mf-font-display: "Orbitron", sans-serif;
+  --mf-font-body: "Space Grotesk", sans-serif;
+}
+
+/* ============================================================================
+   RESPONSIVE MULTI-DEVICE ARCHITECTURE: DESKTOP (>=981px), TABLET (<=980px), MOBILE (<=620px)
+   ============================================================================ */
+:root {
+  --pad: clamp(24px, 4.5vw, 64px);
+  --radius: 12px;
+}
+.site-nav {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 32px;
+  padding: 22px var(--pad);
+}
+.hero {
+  display: grid;
+  grid-template-columns: 1.15fr minmax(360px, 0.85fr);
+  min-height: calc(100vh - 120px);
+  max-height: 860px;
+}
+.hero-copy {
+  padding: clamp(48px, 6vw, 96px) var(--pad);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+.hero-art {
+  position: relative;
+  perspective: 1200px;
+  transform-style: preserve-3d;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.type-strip {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+}
+.product-grid, #pvGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+}
+.bundle-banner {
+  display: grid;
+  grid-template-columns: 1fr minmax(320px, 0.75fr);
+  border-radius: calc(var(--radius) + 4px);
+}
+
+/* Tablet Styles (@media (max-width: 980px)) */
+@media (max-width: 980px) {
+  :root { --pad: 32px; }
+  .site-nav { grid-template-columns: 1fr auto; }
+  .nav-links { display: none; }
+  .nav-actions { grid-column: 2; }
+  .hero { grid-template-columns: 1fr; min-height: auto; max-height: none; }
+  .hero-copy { min-height: 520px; padding: 64px var(--pad) 40px; }
+  .hero-art { min-height: 520px; padding: 30px var(--pad); }
+  .type-strip { grid-template-columns: repeat(3, 1fr); }
+  .product-grid, #pvGrid { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; gap: 18px !important; }
+  .bundle-banner { grid-template-columns: 1fr; }
+  .modal { width: min(720px, calc(100vw - 48px)); }
+}
+
+/* Mobile Styles (@media (max-width: 620px)) */
+@media (max-width: 620px) {
+  :root { --pad: 18px; }
+  .announcement { font-size: 10px; padding-block: 8px; letter-spacing: 0.08em; }
+  .site-nav { padding: 14px var(--pad); }
+  .brand { font-size: 13px; }
+  .brand small { display: none; }
+  .hero { min-height: 0; }
+  .hero-copy { min-height: auto; padding-top: 56px; padding-bottom: 44px; }
+  .hero-actions { flex-direction: column; width: 100%; }
+  .hero-art { min-height: 400px; overflow: hidden; }
+  .orbit { width: 280px; height: 280px; }
+  .hero-card { width: 130px; padding: 8px; }
+  .type-strip { grid-template-columns: repeat(2, 1fr); }
+  .product-grid, #pvGrid { grid-template-columns: 1fr !important; gap: 16px !important; }
+  .drawer { width: 100vw; }
+  .modal { width: calc(100vw - 20px); max-height: calc(100dvh - 20px); border-radius: 12px; }
+  .modal-grid { grid-template-columns: 1fr; }
+}
+
+/* Touch & Accessibility Micro-Interactions (44px minimum tap target) */
+@media (pointer: coarse) {
+  .icon-button, .type-chip, .add-inline, .solid-button, .ghost-button, .pill-button, button, a {
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+  .product-card:hover, .card-anim:hover {
+    transform: translateY(-4px);
+  }
+}
+
+===== FILE: mateflow-schemes.css =====
+:root {
+  --mf-accent: #00C49F;
+  --mf-accent-bright: #00FFD1;
+  --mf-accent-dim: #1D6A63;
+  --mf-bg: #060B0A;
+  --mf-bg-deep: #030706;
+  --mf-surface: #0D1413;
+  --mf-surface-1: #121A19;
+  --mf-surface-2: #172220;
+  --mf-surface-3: #1E2B29;
+  --mf-glass-hex: #0D1615;
+  --mf-text: #E1EBE8;
+  --mf-text-dim: #9AA9A6;
+  --mf-primary: #9CD1C9;
+  --mf-primary-container: #265B55;
+  --mf-on-primary-container: #B8EEE6;
+  --mf-on-primary: #0F4843;
+  --mf-secondary: #B1CCC8;
+  --mf-outline: #657572;
+  --mf-outline-variant: #2F3D3A;
+  --mf-glass-bg: rgba(13, 22, 21, 0.90);
+  --mf-glass-blur: 12px;
+  --mf-holo-bg: rgba(13, 23, 22, 0.65);
+  --mf-holo-blur: 20px;
+  --mf-holo-border: rgba(0, 196, 159, 0.40);
+  --mf-holo-border-hover: rgba(0, 255, 209, 0.85);
+  --mf-l-primary: #1D6A63;
+  --mf-l-on-primary: #FFFFFF;
+  --mf-l-primary-container: #A8F0E7;
+  --mf-l-on-primary-container: #045C56;
+  --mf-l-secondary: #4A6460;
+  --mf-l-on-secondary: #FFFFFF;
+  --mf-l-surface: #FAFCFB;
+  --mf-l-surface-1: #F0F5F3;
+  --mf-l-surface-2: #E8F0ED;
+  --mf-l-surface-3: #DFEAE6;
+  --mf-l-text: #111C1A;
+  --mf-l-text-dim: #4C5B58;
+  --mf-l-outline: #70807D;
+  --mf-l-outline-variant: #C5D3D0;
+  --mf-radius-sm: 6px;
+  --mf-radius: 8px;
+  --mf-radius-md: 12px;
+  --mf-radius-lg: 16px;
+  --mf-radius-xl: 24px;
+  --mf-radius-full: 9999px;
+  --mf-space-xs: 4px;
+  --mf-space-sm: 8px;
+  --mf-space-md: 16px;
+  --mf-space-lg: 24px;
+  --mf-space-xl: 32px;
+  --mf-space-2xl: 48px;
+  --mf-space-3xl: 64px;
+  --mf-space-4xl: 96px;
+  --mf-font-display: "Alata", sans-serif;
+  --mf-font-body: "Instrument Sans", sans-serif;
+  --mf-font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --mf-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --mf-shadow-card: 0 14px 28px rgba(0, 0, 0, 0.60);
+  --mf-shadow-holo: 0 20px 40px rgba(0, 0, 0, 0.70), 0 0 35px -5px rgba(0, 196, 159, 0.30), inset 0 0 20px rgba(0, 196, 159, 0.15);
+  --mf-shadow-holo-hover: 0 25px 50px rgba(0, 0, 0, 0.85), 0 0 45px rgba(0, 196, 159, 0.55), inset 0 0 25px rgba(0, 196, 159, 0.25);
+  --mf-glow-accent: 0 10px 30px -8px rgba(0, 196, 159, 0.50);
+  --mf-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --mf-ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --mf-dur-state: 150ms;
+  --mf-dur-enter: 250ms;
+}
+[data-mf-scheme="light-morning"] { --mf-bg: #FFFFFF; --mf-bg-deep: #FAFCFB; --mf-surface: #FAFCFB; --mf-surface-1: #F0F5F3; --mf-surface-2: #E8F0ED; --mf-surface-3: #DFEAE6; --mf-text: #111827; --mf-text-dim: #475569; --mf-outline: #64748B; --mf-outline-variant: #C5D3D0; --mf-accent: #E11D48; --mf-accent-bright: #F43F5E; --mf-accent-dim: #BE123C; --mf-primary: #1D6A63; --mf-font-display: "Alata", sans-serif; --mf-font-body: "Instrument Sans", sans-serif; }
+[data-mf-scheme="cyber-futuristic"] { --mf-bg: #030712; --mf-bg-deep: #02040A; --mf-accent: #E11D48; --mf-accent-bright: #00FFD1; --mf-accent-dim: #00C49F; --mf-text-dim: #9AA9A6; --mf-font-display: "Space Grotesk", sans-serif; --mf-font-body: "Instrument Sans", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="quantum-manifold"] { --mf-bg: #010208; --mf-bg-deep: #010208; --mf-accent: #FF0055; --mf-accent-bright: #00F0FF; --mf-accent-dim: #B026FF; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="quantum-lobby"] { --mf-bg: #010208; --mf-bg-deep: #010208; --mf-accent: #FF0055; --mf-accent-bright: #00F0FF; --mf-accent-dim: #B026FF; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="cobalt-sapphire"] { --mf-bg: #020617; --mf-bg-deep: #020617; --mf-accent: #0066FF; --mf-accent-bright: #00F0FF; --mf-accent-dim: #2563EB; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="polymorphic-semantic"] { --mf-bg: #020617; --mf-bg-deep: #020617; --mf-accent: #0066FF; --mf-accent-bright: #00F0FF; --mf-accent-dim: #8B5CF6; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="ultraviolet"] { --mf-bg: #05010B; --mf-bg-deep: #05010B; --mf-accent: #A855F7; --mf-accent-bright: #C084FC; --mf-accent-dim: #7E22CE; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="imperium"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #E11D48; --mf-accent-bright: #F43F5E; --mf-accent-dim: #BE123C; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="god-mode"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #E11D48; --mf-accent-bright: #F43F5E; --mf-accent-dim: #BE123C; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="god-mode-gold"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #EAB308; --mf-accent-bright: #FACC15; --mf-accent-dim: #CA8A04; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="white-brown"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #92400E; --mf-accent-bright: #B45309; --mf-accent-dim: #78350F; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="metallic-webgl"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #92400E; --mf-accent-bright: #B45309; --mf-accent-dim: #78350F; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="white-black-metallic"] { --mf-bg: #09090B; --mf-bg-deep: #09090B; --mf-surface: #111827; --mf-surface-1: #18181B; --mf-surface-2: #1F1F23; --mf-surface-3: #27272A; --mf-accent: #FFFFFF; --mf-accent-bright: #FAFAFA; --mf-accent-dim: #64748B; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+
+html, body {
+  background-color: var(--mf-bg) !important;
+  color: var(--mf-text) !important;
+  font-family: var(--mf-font-body) !important;
+  transition: background-color 0.35s ease, color 0.35s ease;
+}
+h1, h2, h3, .mf-display, .mf-h1, .mf-h2, .mf-h3 {
+  font-family: var(--mf-font-display) !important;
+}
+section, .rounded-2xl, .rounded-3xl, .feature-card, .card, .mf-holo {
+  background-color: var(--mf-surface-1) !important;
+  border-color: var(--mf-outline-variant) !important;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.65), 0 0 28px -6px var(--mf-accent) !important;
+}
+
+/* ============================================================================
+   FULL DOM & TAILWIND -> STITCH/MUSE TOKEN BRIDGE (100% SCHEME AUTHORITY)
+   ============================================================================ */
+body {
+  background-color: var(--mf-bg) !important;
+  color: var(--mf-text) !important;
+  font-family: var(--mf-font-body) !important;
+}
+h1, h2, h3, h4, .font-black, .font-extrabold {
+  font-family: var(--mf-font-display) !important;
+  letter-spacing: -0.02em;
+}
+code, pre, .font-mono {
+  font-family: var(--mf-font-mono) !important;
+}
+
+/* Override hardcoded Tailwind backgrounds & borders to obey active [data-mf-scheme] */
+.bg-slate-950, .bg-slate-950\/95, .bg-slate-950\/90 {
+  background-color: var(--mf-bg-deep) !important;
+}
+.bg-slate-900, .bg-slate-900\/95, .bg-slate-900\/90 {
+  background-color: var(--mf-surface-1) !important;
+}
+.bg-slate-800 {
+  background-color: var(--mf-surface-2) !important;
+}
+.border-slate-800, .border-slate-700, .border-slate-900 {
+  border-color: var(--mf-outline-variant) !important;
+}
+.text-slate-300, .text-slate-400, .text-slate-500 {
+  color: var(--mf-text-dim) !important;
+}
+.text-white, .text-slate-100, .text-slate-200 {
+  color: var(--mf-text) !important;
+}
+
+/* Map all primary CTAs, badges, and highlights to --mf-accent & --mf-accent-bright */
+.bg-emerald-500, .bg-emerald-600, .bg-indigo-600, .bg-amber-400 {
+  background: linear-gradient(135deg, var(--mf-accent), var(--mf-accent-bright)) !important;
+  color: #000000 !important;
+  border-color: var(--mf-accent-bright) !important;
+  box-shadow: 0 10px 28px -6px var(--mf-accent) !important;
+}
+.text-emerald-400, .text-emerald-300, .text-indigo-400, .text-indigo-300, .text-amber-400, .text-amber-300 {
+  color: var(--mf-accent-bright) !important;
+}
+.border-emerald-500, .border-emerald-500\/40, .border-emerald-500\/50, .border-emerald-500\/60,
+.border-indigo-500\/40, .border-amber-500\/40 {
+  border-color: var(--mf-accent) !important;
+}
+
+/* Infuse Stitch .mf-holo 60-degree scan-shimmer into all cards & sections */
+section, .rounded-2xl, .rounded-3xl {
+  position: relative;
+  overflow: hidden;
+  background: var(--mf-surface-1) !important;
+  border: 1px solid var(--mf-outline-variant) !important;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.70), 0 0 32px -8px var(--mf-accent), inset 0 1px 0 rgba(255, 255, 255, 0.16) !important;
+}
+.rounded-2xl::after, .rounded-3xl::after {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: linear-gradient(60deg, transparent 42%, rgba(255, 255, 255, 0.07) 50%, transparent 58%);
+  transform: rotate(25deg);
+  opacity: 0;
+  transition: opacity 0.35s ease;
+  pointer-events: none;
+}
+.rounded-2xl:hover, .rounded-3xl:hover {
+  border-color: var(--mf-accent-bright) !important;
+}
+.rounded-2xl:hover::after, .rounded-3xl:hover::after {
+  opacity: 1;
+  animation: mf-scan-shimmer 1.8s infinite;
+}
+

@@ -1,0 +1,941 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MateFlow Chat // Sandbox Terminal</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
+  <style>
+    :root {
+      --mf-bg-deep: #040814;
+      --mf-panel-bg: rgba(9, 17, 36, 0.78);
+      --mf-panel-alt: rgba(13, 24, 48, 0.72);
+      --mf-border: rgba(0, 243, 255, 0.22);
+      --mf-cyan: #00f3ff;
+      --mf-purple: #b026ff;
+      --mf-green: #00ff66;
+      --mf-text: #d9ecff;
+      --mf-muted: #7c93b8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 15% 15%, rgba(176, 38, 255, 0.14), transparent 40%),
+        radial-gradient(circle at 85% 80%, rgba(0, 243, 255, 0.12), transparent 42%),
+        linear-gradient(135deg, #03060f 0%, #071124 55%, #050a18 100%);
+      color: var(--mf-text);
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    .font-mono { font-family: "Cascadia Code", "Fira Code", Consolas, monospace; }
+    .glass {
+      background: var(--mf-panel-bg);
+      backdrop-filter: blur(14px);
+      border: 1px solid var(--mf-border);
+    }
+    .app-shell {
+      display: flex;
+      height: 100vh;
+      width: 100vw;
+      position: relative;
+    }
+    .sidebar-left {
+      width: 260px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--mf-border);
+      background: rgba(5, 10, 22, 0.85);
+    }
+    .main-stage {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      position: relative;
+    }
+    .drawer-right {
+      width: 340px;
+      flex-shrink: 0;
+      border-left: 1px solid var(--mf-border);
+      background: rgba(6, 12, 26, 0.9);
+      display: flex;
+      flex-direction: column;
+      transition: margin-right 0.22s ease, opacity 0.2s ease;
+    }
+    .drawer-right.collapsed {
+      margin-right: -340px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .channel-item {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--mf-muted);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: all 0.15s;
+    }
+    .channel-item:hover { background: rgba(0, 243, 255, 0.08); color: var(--mf-text); }
+    .channel-item.active {
+      background: rgba(0, 243, 255, 0.14);
+      border-color: rgba(0, 243, 255, 0.35);
+      color: var(--mf-cyan);
+    }
+    #messageStream {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .msg-card {
+      background: var(--mf-panel-alt);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 10px;
+      padding: 10px 14px;
+      max-width: 82%;
+    }
+    .msg-card.self {
+      align-self: flex-end;
+      border-color: rgba(0, 243, 255, 0.28);
+      background: rgba(0, 55, 80, 0.35);
+    }
+    .msg-img {
+      max-width: 320px;
+      max-height: 260px;
+      border-radius: 8px;
+      border: 1px solid var(--mf-border);
+      margin-top: 6px;
+      cursor: pointer;
+    }
+    .floating-player {
+      position: fixed;
+      top: 72px;
+      right: 365px;
+      width: 420px;
+      z-index: 1040;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.65);
+    }
+    .floating-player.minimized .player-body { display: none; }
+    .floating-header {
+      cursor: move;
+      background: rgba(8, 16, 36, 0.96);
+      border-bottom: 1px solid var(--mf-border);
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      user-select: none;
+    }
+    .emoji-popover {
+      position: absolute;
+      bottom: 74px;
+      left: 16px;
+      width: 280px;
+      padding: 10px;
+      border-radius: 10px;
+      z-index: 1050;
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 4px;
+    }
+    .emoji-btn {
+      background: transparent;
+      border: none;
+      font-size: 1.25rem;
+      padding: 4px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .emoji-btn:hover { background: rgba(255,255,255,0.12); }
+    .badge-role-admin { background: rgba(176, 38, 255, 0.25); color: #e2a8ff; border: 1px solid rgba(176, 38, 255, 0.5); }
+    .badge-role-seller { background: rgba(0, 243, 255, 0.18); color: var(--mf-cyan); border: 1px solid rgba(0, 243, 255, 0.4); }
+    .pulse-rec { animation: pulseRec 1.2s infinite; color: #ff4d6d !important; }
+    @keyframes pulseRec { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Left Sidebar -->
+    <aside class="sidebar-left p-3">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <div>
+          <div class="fw-bold text-info font-mono">MATEFLOW // SANDBOX</div>
+          <small class="text-secondary font-mono" id="connStatus">CONNECTING...</small>
+        </div>
+        <button class="btn btn-sm btn-outline-info" id="btnSettings" title="Auth / Identity"><i class="bi bi-key"></i></button>
+      </div>
+
+      <div class="p-2 rounded glass mb-3">
+        <div class="d-flex align-items-center justify-content-between">
+          <span class="fw-semibold" id="selfName">guest</span>
+          <span class="badge font-mono" id="selfRoleBadge">seller</span>
+        </div>
+        <button class="btn btn-xs btn-outline-secondary w-100 mt-2 py-1" style="font-size:0.75rem" id="btnMySellerRoom">
+          <i class="bi bi-shop me-1"></i>Open My Seller Room
+        </button>
+      </div>
+
+      <div class="text-uppercase text-secondary font-mono mb-2" style="font-size:0.72rem">Rooms & Channels</div>
+      <div id="roomList" class="d-flex flex-column gap-1 mb-3 overflow-auto" style="max-height: 36vh;"></div>
+
+      <div class="text-uppercase text-secondary font-mono mb-2" style="font-size:0.72rem">Online in Room</div>
+      <div id="onlineList" class="d-flex flex-wrap gap-1 mb-auto"></div>
+
+      <div class="pt-2 border-top border-secondary-subtle mt-2 d-flex gap-2">
+        <button class="btn btn-sm btn-outline-info flex-grow-1" id="btnTogglePlayer">
+          <i class="bi bi-play-btn me-1"></i>Player
+        </button>
+        <button class="btn btn-sm btn-outline-light" id="btnToggleDrawer" title="Inventory & Giveaways">
+          <i class="bi bi-layout-sidebar-reverse"></i>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Chat Stage -->
+    <main class="main-stage">
+      <header class="glass px-3 py-2 d-flex align-items-center justify-content-between" style="border-top:0;border-left:0;border-right:0;">
+        <div class="d-flex align-items-center gap-2">
+          <span class="fw-bold fs-5 text-info font-mono" id="activeRoomTitle">#main-comms</span>
+          <span class="badge bg-dark border border-info-subtle font-mono" id="audioPolicyBadge">AUDIO: STT ONLY</span>
+          <span class="badge bg-dark border border-secondary font-mono" id="followerBadge">0 followers</span>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <!-- Host Audio Toggle -->
+          <button class="btn btn-sm btn-outline-warning d-none" id="btnHostAudioToggle">
+            <i class="bi bi-mic-fill me-1"></i><span>Enable Live Audio</span>
+          </button>
+          <button class="btn btn-sm btn-outline-info" id="btnFollowRoom">
+            <i class="bi bi-heart me-1"></i><span>Follow (1 Entry)</span>
+          </button>
+          <button class="btn btn-sm btn-outline-secondary" id="btnDrawerHeaderToggle">
+            <i class="bi bi-bag me-1"></i>Shop / Giveaway
+          </button>
+        </div>
+      </header>
+
+      <!-- Active Giveaway Banner -->
+      <div id="giveawayBanner" class="px-3 py-2 bg-dark border-bottom border-info-subtle d-none align-items-center justify-content-between">
+        <div class="font-mono small">
+          <i class="bi bi-gift-fill text-warning me-2"></i>
+          <span id="giveawayBannerText" class="text-light">Giveaway Active</span>
+        </div>
+        <span class="badge bg-warning text-dark font-mono" id="giveawayEntryCount">0 entries</span>
+      </div>
+
+      <!-- Messages -->
+      <div id="messageStream"></div>
+
+      <!-- Emoji Popover -->
+      <div id="emojiPopover" class="glass emoji-popover d-none"></div>
+
+      <!-- Composer -->
+      <footer class="glass p-2 m-2 rounded-3 position-relative" id="dropZone">
+        <form id="messageForm" class="d-flex align-items-center gap-2">
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="btnEmoji" title="Emojis"><i class="bi bi-emoji-smile"></i></button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" id="btnUpload" title="Upload JPEG/PNG/GIF (File-Scan Gateway)"><i class="bi bi-image"></i></button>
+          <input type="file" id="fileInput" accept="image/jpeg,image/png,image/gif" class="d-none" />
+          <button type="button" class="btn btn-sm btn-outline-info" id="btnMic" title="Voice (Live if Host enabled, else Speech-to-Text)">
+            <i class="bi bi-mic"></i>
+          </button>
+          <input type="text" id="messageInput" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Message room, paste image, or use mic..." autocomplete="off" />
+          <button type="submit" class="btn btn-sm btn-info fw-semibold px-3">Send</button>
+        </form>
+        <div class="d-flex justify-content-between px-1 pt-1 text-secondary font-mono" style="font-size:0.7rem">
+          <span id="telemetryLeft">READY</span>
+          <span id="telemetryRight">GATEWAY: CLAMAV + RE-ENCODE</span>
+        </div>
+      </footer>
+    </main>
+
+    <!-- Collapsible Right Drawer: Room Inventory & Giveaways -->
+    <aside class="drawer-right" id="rightDrawer">
+      <div class="p-2 border-bottom border-info-subtle d-flex align-items-center justify-content-between">
+        <ul class="nav nav-pills nav-fill w-100 gap-1" style="font-size:0.82rem">
+          <li class="nav-item">
+            <button class="nav-link active py-1" id="tabInvBtn" data-tab="inv"><i class="bi bi-box-seam me-1"></i>Inventory</button>
+          </li>
+          <li class="nav-item">
+            <button class="nav-link py-1" id="tabGiveBtn" data-tab="give"><i class="bi bi-gift me-1"></i>Giveaways</button>
+          </li>
+        </ul>
+      </div>
+
+      <!-- Inventory Tab -->
+      <div id="tabInv" class="p-3 overflow-auto flex-grow-1">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <span class="font-mono small text-info">ROOM INVENTORY</span>
+          <button class="btn btn-xs btn-outline-info py-0 px-2" style="font-size:0.75rem" id="btnRefreshInv"><i class="bi bi-arrow-clockwise"></i></button>
+        </div>
+        <a id="roomStoreBtn" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-outline-success w-100 mb-2 d-none">
+          <i class="bi bi-shop-window me-1"></i>Visit Seller Store
+        </a>
+        <div id="hostStoreBox" class="input-group input-group-sm mb-2 d-none">
+          <input id="storeUrlInput" class="form-control bg-dark text-light border-secondary" placeholder="Storefront URL (https://...)" />
+          <button type="button" class="btn btn-outline-info flex-shrink-0" id="btnSaveStoreUrl">Save</button>
+        </div>
+          <div id="storeSaveStatus" class="small mt-1 text-info d-none"></div>
+        <div id="inventoryList" class="d-flex flex-column gap-2 mb-3"></div>
+
+        <!-- Add Item (Host/Seller) -->
+        <div id="addInvBox" class="p-2 rounded glass mt-2 d-none">
+          <div class="font-mono small text-secondary mb-2">ADD ROOM ITEM</div>
+          <input id="invTitle" class="form-control form-control-sm mb-1 bg-dark text-light" placeholder="Item title" />
+          <div class="d-flex gap-1 mb-1">
+            <input id="invPrice" type="number" step="0.01" class="form-control form-control-sm bg-dark text-light" placeholder="Price" />
+            <input id="invQty" type="number" class="form-control form-control-sm bg-dark text-light" placeholder="Qty" value="1" />
+          </div>
+          <input id="invUrl" class="form-control form-control-sm mb-1 bg-dark text-light" placeholder="Product / Checkout URL (https://...)" />
+          <button id="btnAddInv" class="btn btn-sm btn-outline-info w-100">Add to Room</button>
+        </div>
+      </div>
+
+      <!-- Giveaway Tab -->
+      <div id="tabGive" class="p-3 overflow-auto flex-grow-1 d-none">
+        <div class="p-3 rounded glass mb-3">
+          <div class="font-mono small text-warning mb-1"><i class="bi bi-trophy me-1"></i>FOLLOW = 1 ENTRY</div>
+          <div id="giveawayStatusText" class="small text-light mb-2">No active giveaway.</div>
+          <div id="giveawayWinnerBox" class="alert alert-success py-1 px-2 small d-none"></div>
+          <button id="btnDrawerFollow" class="btn btn-sm btn-info w-100 mb-2">Follow Seller & Enter</button>
+          <div class="small text-secondary font-mono" id="giveawayEntriesList"></div>
+        </div>
+
+        <div id="hostGiveawayControls" class="p-2 rounded glass d-none">
+          <div class="font-mono small text-secondary mb-2">HOST GIVEAWAY CONTROLS</div>
+          <input id="giveawayTitleInput" class="form-control form-control-sm mb-2 bg-dark text-light" placeholder="Prize title (e.g. Mystery Slab)" />
+          <div class="d-flex gap-2">
+            <button id="btnStartGiveaway" class="btn btn-sm btn-outline-warning flex-grow-1">Start</button>
+            <button id="btnDrawGiveaway" class="btn btn-sm btn-success flex-grow-1">Draw Winner</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Floating Player ("BoysTown Live" / Watch a Movie Together) -->
+  <div id="floatingPlayer" class="floating-player glass">
+    <div class="floating-header" id="floatingHeader">
+      <div class="d-flex align-items-center gap-2">
+        <span class="badge bg-danger font-mono">LIVE</span>
+        <span class="font-mono small text-info" id="playerRoomLabel">BoysTown Live</span>
+      </div>
+      <div class="d-flex gap-1">
+        <button class="btn btn-xs btn-outline-secondary py-0 px-1" id="btnMinPlayer" title="Minimize"><i class="bi bi-dash"></i></button>
+        <button class="btn btn-xs btn-outline-secondary py-0 px-1" id="btnClosePlayer" title="Hide"><i class="bi bi-x"></i></button>
+      </div>
+    </div>
+    <div class="player-body bg-black">
+      <video id="syncVideo" class="w-100" style="max-height:240px;background:#000" controls playsinline></video>
+      <div id="hostVideoControls" class="p-2 border-top border-info-subtle bg-dark d-none">
+        <div class="input-group input-group-sm mb-1">
+          <input id="videoUrlInput" class="form-control bg-black text-light border-secondary" placeholder="MP4 / WebM URL to Watch Together" />
+          <button class="btn btn-outline-info" id="btnLoadVideo">Load</button>
+        </div>
+        <div class="d-flex gap-1">
+          <button class="btn btn-xs btn-outline-success flex-grow-1 py-0" id="btnHostPlay"><i class="bi bi-play-fill"></i> Sync Play</button>
+          <button class="btn btn-xs btn-outline-warning flex-grow-1 py-0" id="btnHostPause"><i class="bi bi-pause-fill"></i> Sync Pause</button>
+        </div>
+      </div>
+      <div id="remoteAudioContainer" class="d-none"></div>
+    </div>
+  </div>
+
+  <!-- Auth Modal -->
+  <div class="modal fade" id="authModal" data-bs-backdrop="static" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+      <form id="authForm" class="modal-content glass text-light">
+        <div class="modal-header border-secondary">
+          <h5 class="modal-title font-mono text-info">MATEFLOW // ACCESS KEY</h5>
+        </div>
+        <div class="modal-body">
+          <div id="authError" class="alert alert-danger py-1 small d-none">Invalid key.</div>
+          <label class="form-label small font-mono">Bearer Key</label>
+          <input id="inputKey" type="password" class="form-control bg-dark text-light border-secondary" required />
+        </div>
+        <div class="modal-footer border-secondary">
+          <button type="submit" class="btn btn-info fw-semibold w-100">Connect</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    (() => {
+      const STORAGE_KEY = "mfchat_key";
+      let apiKey = localStorage.getItem(STORAGE_KEY) || "";
+      let me = { name: "guest", role: "seller" };
+      let activeRoom = "main";
+      let roomState = null;
+      let lastId = 0;
+      let ws = null;
+      let localStream = null;
+      let peers = {};
+      let sttRecognition = null;
+      let isMicActive = false;
+
+      const authModal = new bootstrap.Modal(document.getElementById("authModal"));
+      const streamEl = document.getElementById("messageStream");
+      const syncVideo = document.getElementById("syncVideo");
+      const EMOJIS = ["\u{1F525}","\u{1F680}","\u{1F4B0}","\u{1F389}","\u{1F44D}","\u{2764}\u{FE0F}","\u{1F602}","\u{1F60E}","\u{1F4AF}","\u{26A1}","\u{1F3AC}","\u{1F3A4}","\u{1F6D2}","\u{1F3F7}\u{FE0F}","\u{1F4E6}","\u{2705}","\u{1F440}","\u{1F64C}","\u{1F91D}","\u{1F48E}","\u{1F3C6}"];
+
+      function hdr(json = true) {
+        const h = { "Authorization": "Bearer " + apiKey };
+        if (json) h["Content-Type"] = "application/json";
+        return h;
+      }
+
+      function canHost() {
+        return me.role === "admin" || (roomState && roomState.owner === me.name);
+      }
+
+      async function api(url, opts = {}) {
+        const res = await fetch(url, opts);
+        if (res.status === 401) {
+          localStorage.removeItem(STORAGE_KEY);
+          document.getElementById("authError").classList.remove("d-none");
+          authModal.show();
+          throw new Error("unauthorized");
+        }
+        if (!res.ok) throw new Error(await res.text() || ("HTTP " + res.status));
+        return res.json();
+      }
+
+      // Emoji picker setup
+      const emojiPop = document.getElementById("emojiPopover");
+      EMOJIS.forEach(em => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "emoji-btn";
+        b.textContent = em;
+        b.onclick = () => {
+          const inp = document.getElementById("messageInput");
+          inp.value += em;
+          inp.focus();
+          emojiPop.classList.add("d-none");
+        };
+        emojiPop.appendChild(b);
+      });
+      document.getElementById("btnEmoji").onclick = () => emojiPop.classList.toggle("d-none");
+
+      // Draggable Floating Player
+      (() => {
+        const box = document.getElementById("floatingPlayer");
+        const hdrEl = document.getElementById("floatingHeader");
+        let dx = 0, dy = 0, dragging = false;
+        hdrEl.onmousedown = (e) => {
+          if (e.target.closest("button")) return;
+          dragging = true;
+          dx = e.clientX - box.offsetLeft;
+          dy = e.clientY - box.offsetTop;
+        };
+        window.onmousemove = (e) => {
+          if (!dragging) return;
+          box.style.left = Math.max(0, e.clientX - dx) + "px";
+          box.style.top = Math.max(0, e.clientY - dy) + "px";
+          box.style.right = "auto";
+        };
+        window.onmouseup = () => { dragging = false; };
+      })();
+
+      document.getElementById("btnMinPlayer").onclick = () => document.getElementById("floatingPlayer").classList.toggle("minimized");
+      document.getElementById("btnClosePlayer").onclick = () => document.getElementById("floatingPlayer").classList.add("d-none");
+      document.getElementById("btnTogglePlayer").onclick = () => document.getElementById("floatingPlayer").classList.toggle("d-none");
+
+      function toggleDrawer() {
+        document.getElementById("rightDrawer").classList.toggle("collapsed");
+      }
+      document.getElementById("btnToggleDrawer").onclick = toggleDrawer;
+      document.getElementById("btnDrawerHeaderToggle").onclick = toggleDrawer;
+
+      document.querySelectorAll("[data-tab]").forEach(btn => {
+        btn.onclick = () => {
+          document.querySelectorAll("[data-tab]").forEach(b => b.classList.remove("active"));
+          btn.classList.add("active");
+          document.getElementById("tabInv").classList.toggle("d-none", btn.dataset.tab !== "inv");
+          document.getElementById("tabGive").classList.toggle("d-none", btn.dataset.tab !== "give");
+        };
+      });
+
+      function appendMessage(m) {
+        if (m.id && m.id <= lastId) return;
+        if (m.id) lastId = m.id;
+        const card = document.createElement("div");
+        card.className = "msg-card" + (m.from === me.name ? " self" : "");
+        const top = document.createElement("div");
+        top.className = "d-flex align-items-center gap-2 mb-1";
+        const nameEl = document.createElement("span");
+        nameEl.className = "fw-bold text-info small";
+        nameEl.textContent = m.from;
+        top.appendChild(nameEl);
+        if (m.role) {
+          const rb = document.createElement("span");
+          rb.className = "badge font-mono " + (m.role === "admin" ? "badge-role-admin" : "badge-role-seller");
+          rb.style.fontSize = "0.65rem";
+          rb.textContent = m.role;
+          top.appendChild(rb);
+        }
+        if (m.stt) {
+          const sb = document.createElement("span");
+          sb.className = "badge bg-secondary font-mono";
+          sb.style.fontSize = "0.62rem";
+          sb.textContent = "STT";
+          top.appendChild(sb);
+        }
+        const timeEl = document.createElement("span");
+        timeEl.className = "text-secondary font-mono ms-auto";
+        timeEl.style.fontSize = "0.68rem";
+        timeEl.textContent = m.at ? new Date(m.at).toLocaleTimeString([], { hour12: false }) : "";
+        top.appendChild(timeEl);
+        card.appendChild(top);
+
+        if (m.text) {
+          const body = document.createElement("div");
+          body.className = "small";
+          body.style.whiteSpace = "pre-wrap";
+          body.textContent = m.text;
+          card.appendChild(body);
+        }
+        if (m.media_url) {
+          const img = document.createElement("img");
+          img.src = m.media_url;
+          img.className = "msg-img d-block";
+          img.onclick = () => window.open(m.media_url, "_blank");
+          card.appendChild(img);
+        }
+        if (m.pinned_item) {
+          const box = document.createElement("div");
+          box.className = "mt-2 p-2 rounded border border-info-subtle bg-dark small";
+          const linkHtml = (m.pinned_item.url && /^https?:\/\//i.test(m.pinned_item.url))
+            ? `<a href="${m.pinned_item.url}" target="_blank" rel="noopener noreferrer" class="btn btn-xs btn-success py-0 px-2 mt-1">View / Buy <i class="bi bi-box-arrow-up-right ms-1"></i></a>`
+            : "";
+          box.innerHTML = `<div class="fw-bold text-info"><i class="bi bi-pin-angle-fill me-1"></i>${m.pinned_item.title}</div>
+            <div class="font-mono text-success">$${Number(m.pinned_item.price).toFixed(2)} ? Qty: ${m.pinned_item.quantity}</div>${linkHtml}`;
+          card.appendChild(box);
+        }
+        streamEl.appendChild(card);
+        streamEl.scrollTop = streamEl.scrollHeight;
+      }
+
+      function applyRoomState(rs) {
+        roomState = rs;
+        document.getElementById("activeRoomTitle").textContent = rs.title || rs.id;
+        document.getElementById("playerRoomLabel").textContent = rs.title || rs.id;
+        document.getElementById("followerBadge").textContent = `${rs.follower_count || 0} followers`;
+
+        const audioBadge = document.getElementById("audioPolicyBadge");
+        const isLive = rs.audio_mode === "live";
+        audioBadge.textContent = isLive ? "AUDIO: LIVE MIC" : "AUDIO: STT ONLY";
+        audioBadge.className = "badge font-mono " + (isLive ? "bg-success" : "bg-dark border border-info-subtle");
+
+        const followBtn = document.getElementById("btnFollowRoom");
+        followBtn.innerHTML = rs.followed_by_me ? '<i class="bi bi-heart-fill text-danger me-1"></i>Followed (Entered)' : '<i class="bi bi-heart me-1"></i>Follow (1 Entry)';
+
+        // Host controls visibility
+        const host = canHost();
+        document.getElementById("btnHostAudioToggle").classList.toggle("d-none", !host);
+        document.getElementById("btnHostAudioToggle").querySelector("span").textContent = isLive ? "Switch to STT-Only" : "Enable Live Audio";
+        document.getElementById("hostVideoControls").classList.toggle("d-none", !host);
+        document.getElementById("hostGiveawayControls").classList.toggle("d-none", !host);
+        document.getElementById("addInvBox").classList.toggle("d-none", !(host || me.role === "seller"));
+        document.getElementById("hostStoreBox").classList.toggle("d-none", !host);
+        const sui = document.getElementById("storeUrlInput"); if (sui && document.activeElement !== sui) sui.value = rs.store_url || "";
+        const storeBtn = document.getElementById("roomStoreBtn");
+        if (rs.store_url && /^https?:\/\//i.test(rs.store_url)) {
+          storeBtn.href = rs.store_url;
+          storeBtn.classList.remove("d-none");
+        } else {
+          storeBtn.classList.add("d-none");
+        }
+
+        // Online badges
+        const onlineEl = document.getElementById("onlineList");
+        onlineEl.innerHTML = "";
+        (rs.online || []).forEach(u => {
+          const sp = document.createElement("span");
+          sp.className = "badge bg-dark border border-info-subtle font-mono";
+          sp.textContent = u;
+          onlineEl.appendChild(sp);
+        });
+
+        // Video sync
+        if (rs.video && rs.video.url) {
+          if (syncVideo.dataset.src !== rs.video.url) {
+            syncVideo.dataset.src = rs.video.url;
+            syncVideo.src = rs.video.url;
+            document.getElementById("videoUrlInput").value = rs.video.url;
+          }
+          const drift = rs.video.playing ? (Date.now() - rs.video.updated_at) / 1000 : 0;
+          const target = Math.max(0, (rs.video.position || 0) + drift);
+          if (Math.abs((syncVideo.currentTime || 0) - target) > 1.8) {
+            syncVideo.currentTime = target;
+          }
+          if (rs.video.playing && syncVideo.paused) syncVideo.play().catch(() => {});
+          if (!rs.video.playing && !syncVideo.paused) syncVideo.pause();
+        }
+
+        // Giveaway UI
+        const gw = rs.giveaway || {};
+        const banner = document.getElementById("giveawayBanner");
+        if (gw.active) {
+          banner.classList.remove("d-none");
+          banner.classList.add("d-flex");
+          document.getElementById("giveawayBannerText").textContent = `GIVEAWAY: ${gw.title} ? Follow seller for 1 entry!`;
+          document.getElementById("giveawayEntryCount").textContent = `${(gw.entries || []).length} entries`;
+          document.getElementById("giveawayStatusText").textContent = `Active: ${gw.title} (${(gw.entries || []).length} entries)`;
+        } else {
+          banner.classList.add("d-none");
+          banner.classList.remove("d-flex");
+          document.getElementById("giveawayStatusText").textContent = "No active giveaway right now.";
+        }
+        const winBox = document.getElementById("giveawayWinnerBox");
+        if (gw.winner) {
+          winBox.classList.remove("d-none");
+          winBox.textContent = `Winner: ${gw.winner}!`;
+        } else {
+          winBox.classList.add("d-none");
+        }
+        document.getElementById("giveawayEntriesList").textContent = (gw.entries && gw.entries.length) ? ("Entries: " + gw.entries.join(", ")) : "";
+      }
+
+      async function loadRooms() {
+        const list = await api("/api/rooms", { headers: hdr(false) });
+        const el = document.getElementById("roomList");
+        el.innerHTML = "";
+        list.sort((a, b) => a.id.localeCompare(b.id)).forEach(r => {
+          const btn = document.createElement("button");
+          btn.className = "channel-item" + (r.id === activeRoom ? " active" : "");
+          btn.innerHTML = `<span>${r.title || r.id}</span><span class="badge bg-dark font-mono">${(r.online || []).length}</span>`;
+          btn.onclick = () => switchRoom(r.id);
+          el.appendChild(btn);
+        });
+      }
+
+      async function loadInventory() {
+        const items = await api("/api/inventory?room=" + encodeURIComponent(activeRoom), { headers: hdr(false) });
+        const el = document.getElementById("inventoryList");
+        el.innerHTML = "";
+        if (!items.length) {
+          el.innerHTML = '<div class="small text-secondary">No items in this room yet.</div>';
+          return;
+        }
+        items.forEach(it => {
+          const card = document.createElement("div");
+          card.className = "p-2 rounded glass";
+          card.innerHTML = `
+            <div class="d-flex justify-content-between align-items-start">
+              <div class="fw-semibold small text-light">${it.title}</div>
+              <span class="badge bg-success font-mono">$${Number(it.price).toFixed(2)}</span>
+            </div>
+            <div class="text-secondary font-mono mt-1" style="font-size:0.72rem">Qty: ${it.quantity} ? ${it.condition || "NEW"}</div>
+            <div class="d-flex gap-1 mt-2">
+              <button class="btn btn-xs btn-outline-info flex-grow-1 py-0 pin-btn">Pin to Chat</button>
+              ${(it.url && /^https?:\/\//i.test(it.url)) ? `<a href="${it.url}" target="_blank" rel="noopener noreferrer" class="btn btn-xs btn-success py-0 px-2">Buy / Link</a>` : ""}
+            </div>`;
+          card.querySelector(".pin-btn").onclick = async () => {
+            await api("/api/messages", {
+              method: "POST",
+              headers: hdr(),
+              body: JSON.stringify({ room: activeRoom, text: `Pinned item: ${it.title}`, pinned_item: it })
+            });
+          };
+          el.appendChild(card);
+        });
+      }
+
+      function connectWS() {
+        if (ws) ws.close();
+        const proto = location.protocol === "https:" ? "wss://" : "ws://";
+        ws = new WebSocket(`${proto}${location.host}/ws?room=${encodeURIComponent(activeRoom)}&token=${encodeURIComponent(apiKey)}`);
+        ws.onopen = () => { document.getElementById("connStatus").textContent = "WS // ONLINE"; };
+        ws.onclose = () => { document.getElementById("connStatus").textContent = "WS // RECONNECTING"; setTimeout(connectWS, 2500); };
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "chat") appendMessage(msg.data);
+          if (msg.type === "room_state") applyRoomState(msg.data);
+          if (msg.type === "rtc_signal") handleRTCSignal(msg.from, msg.data);
+        };
+      }
+
+      async function switchRoom(roomId) {
+        activeRoom = roomId;
+        lastId = 0;
+        streamEl.innerHTML = "";
+        stopMic();
+        await loadRooms();
+        const msgs = await api(`/api/messages?room=${encodeURIComponent(activeRoom)}&since=0`, { headers: hdr(false) });
+        msgs.forEach(appendMessage);
+        const rs = await api(`/api/rooms/state?room=${encodeURIComponent(activeRoom)}`, { headers: hdr(false) });
+        applyRoomState(rs);
+        await loadInventory();
+        connectWS();
+      }
+
+      // File-Scan Upload Gateway (JPEG/PNG/GIF)
+      async function uploadFile(file) {
+        if (!file) return;
+        const tel = document.getElementById("telemetryLeft");
+        tel.textContent = "SCANNING VIA CLAMAV GATEWAY...";
+        const fd = new FormData();
+        fd.append("file", file);
+        try {
+          const res = await api("/api/upload", { method: "POST", headers: hdr(false), body: fd });
+          tel.textContent = `CLEAN (${res.scan}) // POSTING MEDIA`;
+          await api("/api/messages", {
+            method: "POST",
+            headers: hdr(),
+            body: JSON.stringify({ room: activeRoom, text: "", media_url: res.url, media_type: res.mime })
+          });
+          tel.textContent = "READY";
+        } catch (err) {
+          tel.textContent = "UPLOAD BLOCKED: " + err.message;
+        }
+      }
+
+      document.getElementById("btnUpload").onclick = () => document.getElementById("fileInput").click();
+      document.getElementById("fileInput").onchange = (e) => uploadFile(e.target.files[0]);
+      document.getElementById("messageInput").addEventListener("paste", (e) => {
+        const item = Array.from(e.clipboardData?.items || []).find(i => i.type.startsWith("image/"));
+        if (item) uploadFile(item.getAsFile());
+      });
+
+      // Audio Policy: Host Live Audio (WebRTC) vs Speech-to-Text Fallback
+      async function handleRTCSignal(from, data) {
+        if (!roomState || roomState.audio_mode !== "live") return;
+        let pc = peers[from];
+        if (!pc) {
+          pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+          peers[from] = pc;
+          pc.onicecandidate = (e) => {
+            if (e.candidate && ws) ws.send(JSON.stringify({ type: "rtc_signal", to: from, data: { candidate: e.candidate } }));
+          };
+          pc.ontrack = (e) => {
+            let a = document.getElementById("audio-" + from);
+            if (!a) {
+              a = document.createElement("audio");
+              a.id = "audio-" + from;
+              a.autoplay = true;
+              document.getElementById("remoteAudioContainer").appendChild(a);
+            }
+            a.srcObject = e.streams[0];
+          };
+          if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+        }
+        if (data.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          if (data.sdp.type === "offer") {
+            const ans = await pc.createAnswer();
+            await pc.setLocalDescription(ans);
+            ws.send(JSON.stringify({ type: "rtc_signal", to: from, data: { sdp: pc.localDescription } }));
+          }
+        } else if (data.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
+        }
+      }
+
+      function stopMic() {
+        isMicActive = false;
+        document.getElementById("btnMic").classList.remove("pulse-rec");
+        if (sttRecognition) { try { sttRecognition.stop(); } catch {} sttRecognition = null; }
+        if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+        Object.values(peers).forEach(p => p.close());
+        peers = {};
+      }
+
+      document.getElementById("btnMic").onclick = async () => {
+        if (isMicActive) { stopMic(); return; }
+        isMicActive = true;
+        document.getElementById("btnMic").classList.add("pulse-rec");
+
+        if (roomState && roomState.audio_mode === "live") {
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            (roomState.online || []).filter(u => u !== me.name).forEach(async peerName => {
+              const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+              peers[peerName] = pc;
+              localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+              pc.onicecandidate = (e) => {
+                if (e.candidate && ws) ws.send(JSON.stringify({ type: "rtc_signal", to: peerName, data: { candidate: e.candidate } }));
+              };
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              ws.send(JSON.stringify({ type: "rtc_signal", to: peerName, data: { sdp: pc.localDescription } }));
+            });
+            document.getElementById("telemetryLeft").textContent = "LIVE AUDIO STREAMING";
+          } catch (err) {
+            stopMic();
+            document.getElementById("telemetryLeft").textContent = "MIC ERROR: " + err.message;
+          }
+        } else {
+          const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (!SR) {
+            stopMic();
+            alert("Speech-to-Text not supported in this browser (try Chrome/Edge).");
+            return;
+          }
+          sttRecognition = new SR();
+          sttRecognition.continuous = true;
+          sttRecognition.interimResults = false;
+          sttRecognition.onresult = async (ev) => {
+            const transcript = ev.results[ev.results.length - 1][0].transcript.trim();
+            if (transcript) {
+              await api("/api/messages", {
+                method: "POST",
+                headers: hdr(),
+                body: JSON.stringify({ room: activeRoom, text: transcript, stt: true })
+              });
+            }
+          };
+          sttRecognition.onend = () => { if (isMicActive) sttRecognition.start(); };
+          sttRecognition.start();
+          document.getElementById("telemetryLeft").textContent = "STT ACTIVE (HOST DISABLED LIVE AUDIO)";
+        }
+      };
+
+      // Form & Button Handlers
+      document.getElementById("messageForm").onsubmit = async (e) => {
+        e.preventDefault();
+        const inp = document.getElementById("messageInput");
+        const text = inp.value.trim();
+        if (!text) return;
+        inp.value = "";
+        await api("/api/messages", {
+          method: "POST",
+          headers: hdr(),
+          body: JSON.stringify({ room: activeRoom, text })
+        });
+      };
+
+      document.getElementById("btnHostAudioToggle").onclick = async () => {
+        const next = roomState?.audio_mode === "live" ? "stt_only" : "live";
+        await api(`/api/rooms/audio?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ audio_mode: next })
+        });
+      };
+
+      async function followRoom() {
+        await api(`/api/rooms/follow?room=${encodeURIComponent(activeRoom)}`, { method: "POST", headers: hdr() });
+      }
+      document.getElementById("btnFollowRoom").onclick = followRoom;
+      document.getElementById("btnDrawerFollow").onclick = followRoom;
+
+      document.getElementById("btnStartGiveaway").onclick = async () => {
+        const title = document.getElementById("giveawayTitleInput").value.trim();
+        await api(`/api/rooms/giveaway?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "start", title })
+        });
+      };
+      document.getElementById("btnDrawGiveaway").onclick = async () => {
+        await api(`/api/rooms/giveaway?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "draw" })
+        });
+      };
+
+      document.getElementById("btnLoadVideo").onclick = async () => {
+        const url = document.getElementById("videoUrlInput").value.trim();
+        await api(`/api/rooms/video?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "load", url })
+        });
+      };
+      document.getElementById("btnHostPlay").onclick = async () => {
+        await api(`/api/rooms/video?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "play", url: document.getElementById("videoUrlInput").value.trim(), position: syncVideo.currentTime || 0 })
+        });
+      };
+      document.getElementById("btnHostPause").onclick = async () => {
+        await api(`/api/rooms/video?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ action: "pause", position: syncVideo.currentTime || 0 })
+        });
+      };
+
+      document.getElementById("btnRefreshInv").onclick = loadInventory;
+            const btnSaveStore = document.getElementById("btnSaveStoreUrl");
+      if (btnSaveStore) btnSaveStore.onclick = async () => {
+        const stEl = document.getElementById("storeSaveStatus");
+        const nameEl = document.getElementById("storeNameInput");
+        const urlEl = document.getElementById("storeUrlInput");
+        const store_name = nameEl ? nameEl.value.trim() : "";
+        let store_url = urlEl ? urlEl.value.trim() : "";
+        if (store_url && !/^https?:\/\//i.test(store_url)) {
+          store_url = "https://" + store_url;
+          if (urlEl) urlEl.value = store_url;
+        }
+        try {
+          const res = await api(`/api/rooms/store?room=${encodeURIComponent(activeRoom)}`, {
+            method: "POST", headers: hdr(), body: JSON.stringify({ store_name, store_url })
+          });
+          if (stEl) {
+            stEl.textContent = "Saved!";
+            stEl.className = "small mt-1 text-success";
+            stEl.classList.remove("d-none");
+            setTimeout(() => stEl.classList.add("d-none"), 2500);
+          }
+        } catch (err) {
+          if (stEl) {
+            stEl.textContent = "Save failed: " + (err.message || err);
+            stEl.className = "small mt-1 text-danger";
+            stEl.classList.remove("d-none");
+          }
+        }
+      };
+
+      document.getElementById("btnAddInv").onclick = async () => {
+        const title = document.getElementById("invTitle").value.trim();
+        const price = parseFloat(document.getElementById("invPrice").value || "0");
+        const quantity = parseInt(document.getElementById("invQty").value || "1", 10);
+        const url = document.getElementById("invUrl").value.trim();
+        if (!title) return;
+        await api(`/api/inventory?room=${encodeURIComponent(activeRoom)}`, {
+          method: "POST", headers: hdr(), body: JSON.stringify({ room: activeRoom, title, price, quantity, condition: "NEW", url })
+        });
+        document.getElementById("invTitle").value = "";
+        document.getElementById("invUrl").value = "";
+        await loadInventory();
+      };
+
+      document.getElementById("btnMySellerRoom").onclick = async () => {
+        const id = "seller:" + me.name;
+        await api("/api/rooms", { method: "POST", headers: hdr(), body: JSON.stringify({ id, title: "Seller // " + me.name }) });
+        await switchRoom(id);
+      };
+
+      document.getElementById("btnSettings").onclick = () => {
+        document.getElementById("inputKey").value = apiKey;
+        authModal.show();
+      };
+      document.getElementById("authForm").onsubmit = async (e) => {
+        e.preventDefault();
+        apiKey = document.getElementById("inputKey").value.trim();
+        localStorage.setItem(STORAGE_KEY, apiKey);
+        authModal.hide();
+        await boot();
+      };
+
+      async function boot() {
+        me = await api("/api/me", { headers: hdr(false) });
+        document.getElementById("selfName").textContent = me.name;
+        const rb = document.getElementById("selfRoleBadge");
+        rb.textContent = me.role;
+        rb.className = "badge font-mono " + (me.role === "admin" ? "badge-role-admin" : "badge-role-seller");
+        await switchRoom(activeRoom);
+      }
+
+      if (!apiKey) authModal.show();
+      else boot().catch(() => {});
+    })();
+  </script>
+</body>
+</html>

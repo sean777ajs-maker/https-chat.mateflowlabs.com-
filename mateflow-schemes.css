@@ -1,0 +1,175 @@
+:root {
+  --mf-accent: #00C49F;
+  --mf-accent-bright: #00FFD1;
+  --mf-accent-dim: #1D6A63;
+  --mf-bg: #060B0A;
+  --mf-bg-deep: #030706;
+  --mf-surface: #0D1413;
+  --mf-surface-1: #121A19;
+  --mf-surface-2: #172220;
+  --mf-surface-3: #1E2B29;
+  --mf-glass-hex: #0D1615;
+  --mf-text: #E1EBE8;
+  --mf-text-dim: #9AA9A6;
+  --mf-primary: #9CD1C9;
+  --mf-primary-container: #265B55;
+  --mf-on-primary-container: #B8EEE6;
+  --mf-on-primary: #0F4843;
+  --mf-secondary: #B1CCC8;
+  --mf-outline: #657572;
+  --mf-outline-variant: #2F3D3A;
+  --mf-glass-bg: rgba(13, 22, 21, 0.90);
+  --mf-glass-blur: 12px;
+  --mf-holo-bg: rgba(13, 23, 22, 0.65);
+  --mf-holo-blur: 20px;
+  --mf-holo-border: rgba(0, 196, 159, 0.40);
+  --mf-holo-border-hover: rgba(0, 255, 209, 0.85);
+  --mf-l-primary: #1D6A63;
+  --mf-l-on-primary: #FFFFFF;
+  --mf-l-primary-container: #A8F0E7;
+  --mf-l-on-primary-container: #045C56;
+  --mf-l-secondary: #4A6460;
+  --mf-l-on-secondary: #FFFFFF;
+  --mf-l-surface: #FAFCFB;
+  --mf-l-surface-1: #F0F5F3;
+  --mf-l-surface-2: #E8F0ED;
+  --mf-l-surface-3: #DFEAE6;
+  --mf-l-text: #111C1A;
+  --mf-l-text-dim: #4C5B58;
+  --mf-l-outline: #70807D;
+  --mf-l-outline-variant: #C5D3D0;
+  --mf-radius-sm: 6px;
+  --mf-radius: 8px;
+  --mf-radius-md: 12px;
+  --mf-radius-lg: 16px;
+  --mf-radius-xl: 24px;
+  --mf-radius-full: 9999px;
+  --mf-space-xs: 4px;
+  --mf-space-sm: 8px;
+  --mf-space-md: 16px;
+  --mf-space-lg: 24px;
+  --mf-space-xl: 32px;
+  --mf-space-2xl: 48px;
+  --mf-space-3xl: 64px;
+  --mf-space-4xl: 96px;
+  --mf-font-display: "Alata", sans-serif;
+  --mf-font-body: "Instrument Sans", sans-serif;
+  --mf-font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --mf-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --mf-shadow-card: 0 14px 28px rgba(0, 0, 0, 0.60);
+  --mf-shadow-holo: 0 20px 40px rgba(0, 0, 0, 0.70), 0 0 35px -5px rgba(0, 196, 159, 0.30), inset 0 0 20px rgba(0, 196, 159, 0.15);
+  --mf-shadow-holo-hover: 0 25px 50px rgba(0, 0, 0, 0.85), 0 0 45px rgba(0, 196, 159, 0.55), inset 0 0 25px rgba(0, 196, 159, 0.25);
+  --mf-glow-accent: 0 10px 30px -8px rgba(0, 196, 159, 0.50);
+  --mf-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --mf-ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --mf-dur-state: 150ms;
+  --mf-dur-enter: 250ms;
+}
+[data-mf-scheme="light-morning"] { --mf-bg: #FFFFFF; --mf-bg-deep: #FAFCFB; --mf-surface: #FAFCFB; --mf-surface-1: #F0F5F3; --mf-surface-2: #E8F0ED; --mf-surface-3: #DFEAE6; --mf-text: #111827; --mf-text-dim: #475569; --mf-outline: #64748B; --mf-outline-variant: #C5D3D0; --mf-accent: #E11D48; --mf-accent-bright: #F43F5E; --mf-accent-dim: #BE123C; --mf-primary: #1D6A63; --mf-font-display: "Alata", sans-serif; --mf-font-body: "Instrument Sans", sans-serif; }
+[data-mf-scheme="cyber-futuristic"] { --mf-bg: #030712; --mf-bg-deep: #02040A; --mf-accent: #E11D48; --mf-accent-bright: #00FFD1; --mf-accent-dim: #00C49F; --mf-text-dim: #9AA9A6; --mf-font-display: "Space Grotesk", sans-serif; --mf-font-body: "Instrument Sans", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="quantum-manifold"] { --mf-bg: #010208; --mf-bg-deep: #010208; --mf-accent: #FF0055; --mf-accent-bright: #00F0FF; --mf-accent-dim: #B026FF; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="quantum-lobby"] { --mf-bg: #010208; --mf-bg-deep: #010208; --mf-accent: #FF0055; --mf-accent-bright: #00F0FF; --mf-accent-dim: #B026FF; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="cobalt-sapphire"] { --mf-bg: #020617; --mf-bg-deep: #020617; --mf-accent: #0066FF; --mf-accent-bright: #00F0FF; --mf-accent-dim: #2563EB; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="polymorphic-semantic"] { --mf-bg: #020617; --mf-bg-deep: #020617; --mf-accent: #0066FF; --mf-accent-bright: #00F0FF; --mf-accent-dim: #8B5CF6; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="ultraviolet"] { --mf-bg: #05010B; --mf-bg-deep: #05010B; --mf-accent: #A855F7; --mf-accent-bright: #C084FC; --mf-accent-dim: #7E22CE; --mf-font-display: "Orbitron", sans-serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="imperium"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #E11D48; --mf-accent-bright: #F43F5E; --mf-accent-dim: #BE123C; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="god-mode"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #E11D48; --mf-accent-bright: #F43F5E; --mf-accent-dim: #BE123C; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="god-mode-gold"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #EAB308; --mf-accent-bright: #FACC15; --mf-accent-dim: #CA8A04; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="white-brown"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #92400E; --mf-accent-bright: #B45309; --mf-accent-dim: #78350F; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="metallic-webgl"] { --mf-bg: #111827; --mf-bg-deep: #0B1120; --mf-accent: #92400E; --mf-accent-bright: #B45309; --mf-accent-dim: #78350F; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+[data-mf-scheme="white-black-metallic"] { --mf-bg: #09090B; --mf-bg-deep: #09090B; --mf-surface: #111827; --mf-surface-1: #18181B; --mf-surface-2: #1F1F23; --mf-surface-3: #27272A; --mf-accent: #FFFFFF; --mf-accent-bright: #FAFAFA; --mf-accent-dim: #64748B; --mf-text-dim: #64748B; --mf-outline: #475569; --mf-font-display: "Cinzel", serif; --mf-font-body: "Space Grotesk", sans-serif; --mf-font-mono: "JetBrains Mono", ui-monospace, monospace; }
+
+html, body {
+  background-color: var(--mf-bg) !important;
+  color: var(--mf-text) !important;
+  font-family: var(--mf-font-body) !important;
+  transition: background-color 0.35s ease, color 0.35s ease;
+}
+h1, h2, h3, .mf-display, .mf-h1, .mf-h2, .mf-h3 {
+  font-family: var(--mf-font-display) !important;
+}
+section, .rounded-2xl, .rounded-3xl, .feature-card, .card, .mf-holo {
+  background-color: var(--mf-surface-1) !important;
+  border-color: var(--mf-outline-variant) !important;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.65), 0 0 28px -6px var(--mf-accent) !important;
+}
+
+/* ============================================================================
+   FULL DOM & TAILWIND -> STITCH/MUSE TOKEN BRIDGE (100% SCHEME AUTHORITY)
+   ============================================================================ */
+body {
+  background-color: var(--mf-bg) !important;
+  color: var(--mf-text) !important;
+  font-family: var(--mf-font-body) !important;
+}
+h1, h2, h3, h4, .font-black, .font-extrabold {
+  font-family: var(--mf-font-display) !important;
+  letter-spacing: -0.02em;
+}
+code, pre, .font-mono {
+  font-family: var(--mf-font-mono) !important;
+}
+
+/* Override hardcoded Tailwind backgrounds & borders to obey active [data-mf-scheme] */
+.bg-slate-950, .bg-slate-950\/95, .bg-slate-950\/90 {
+  background-color: var(--mf-bg-deep) !important;
+}
+.bg-slate-900, .bg-slate-900\/95, .bg-slate-900\/90 {
+  background-color: var(--mf-surface-1) !important;
+}
+.bg-slate-800 {
+  background-color: var(--mf-surface-2) !important;
+}
+.border-slate-800, .border-slate-700, .border-slate-900 {
+  border-color: var(--mf-outline-variant) !important;
+}
+.text-slate-300, .text-slate-400, .text-slate-500 {
+  color: var(--mf-text-dim) !important;
+}
+.text-white, .text-slate-100, .text-slate-200 {
+  color: var(--mf-text) !important;
+}
+
+/* Map all primary CTAs, badges, and highlights to --mf-accent & --mf-accent-bright */
+.bg-emerald-500, .bg-emerald-600, .bg-indigo-600, .bg-amber-400 {
+  background: linear-gradient(135deg, var(--mf-accent), var(--mf-accent-bright)) !important;
+  color: #000000 !important;
+  border-color: var(--mf-accent-bright) !important;
+  box-shadow: 0 10px 28px -6px var(--mf-accent) !important;
+}
+.text-emerald-400, .text-emerald-300, .text-indigo-400, .text-indigo-300, .text-amber-400, .text-amber-300 {
+  color: var(--mf-accent-bright) !important;
+}
+.border-emerald-500, .border-emerald-500\/40, .border-emerald-500\/50, .border-emerald-500\/60,
+.border-indigo-500\/40, .border-amber-500\/40 {
+  border-color: var(--mf-accent) !important;
+}
+
+/* Infuse Stitch .mf-holo 60-degree scan-shimmer into all cards & sections */
+section, .rounded-2xl, .rounded-3xl {
+  position: relative;
+  overflow: hidden;
+  background: var(--mf-surface-1) !important;
+  border: 1px solid var(--mf-outline-variant) !important;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.70), 0 0 32px -8px var(--mf-accent), inset 0 1px 0 rgba(255, 255, 255, 0.16) !important;
+}
+.rounded-2xl::after, .rounded-3xl::after {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: linear-gradient(60deg, transparent 42%, rgba(255, 255, 255, 0.07) 50%, transparent 58%);
+  transform: rotate(25deg);
+  opacity: 0;
+  transition: opacity 0.35s ease;
+  pointer-events: none;
+}
+.rounded-2xl:hover, .rounded-3xl:hover {
+  border-color: var(--mf-accent-bright) !important;
+}
+.rounded-2xl:hover::after, .rounded-3xl:hover::after {
+  opacity: 1;
+  animation: mf-scan-shimmer 1.8s infinite;
+}
