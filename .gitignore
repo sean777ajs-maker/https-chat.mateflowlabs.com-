@@ -1,0 +1,4 @@
+# Build output (see README)
+/mfchat
+/main.wasm
+/wasm_exec.js
