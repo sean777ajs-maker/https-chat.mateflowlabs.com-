@@ -168,10 +168,48 @@
   </style>
   <link rel="stylesheet" href="/mateflow-schemes.css" />
   <style id="mf-scheme-bridge">
-    body { background-color: var(--mf-bg, #060B0A) !important; color: var(--mf-text, #E1EBE8) !important; font-family: var(--mf-font-body, sans-serif); }
-    .glass { background: var(--mf-glass-bg, rgba(13,22,21,0.9)) !important; backdrop-filter: blur(var(--mf-glass-blur, 12px)); border-color: var(--mf-outline-variant, #2F3D3A) !important; }
+    /* Every shell colour derives from the active scheme's --mf-bg / --mf-text / --mf-accent*,
+       so no scheme (or the old hard-coded cyan/purple/green) can leak into another. */
+    :root {
+      --mfc-shell: color-mix(in srgb, var(--mf-bg, #060B0A) 95%, var(--mf-text, #E1EBE8));
+      --mfc-panel: color-mix(in srgb, var(--mf-bg, #060B0A) 90%, var(--mf-text, #E1EBE8));
+      --mfc-panel-alt: color-mix(in srgb, var(--mf-bg, #060B0A) 84%, var(--mf-text, #E1EBE8));
+      --mfc-line: color-mix(in srgb, var(--mf-accent-bright, #00FFD1) 30%, transparent);
+      --mfc-tint: color-mix(in srgb, var(--mf-accent-bright, #00FFD1) 13%, transparent);
+      --mf-border: var(--mfc-line);
+      --mf-cyan: var(--mf-accent-bright, #00FFD1);
+      --mf-muted: var(--mf-text-dim, #9AA9A6);
+      --mf-panel-bg: var(--mfc-panel);
+      --mf-panel-alt: var(--mfc-panel-alt);
+    }
+    body { background: var(--mf-bg, #060B0A) !important; color: var(--mf-text, #E1EBE8) !important; font-family: var(--mf-font-body, sans-serif); }
+    .sidebar-left, .drawer-right { background: var(--mfc-shell) !important; border-color: var(--mfc-line) !important; }
+    .glass { background: var(--mfc-panel) !important; backdrop-filter: blur(var(--mf-glass-blur, 12px)); border-color: var(--mfc-line) !important; }
+    .floating-header { background: var(--mfc-panel) !important; }
+    .msg-card { border-color: color-mix(in srgb, var(--mf-text, #E1EBE8) 10%, transparent); }
+    .msg-card.self { background: color-mix(in srgb, var(--mf-accent-bright, #00FFD1) 14%, var(--mf-bg, #060B0A)); border-color: var(--mfc-line); }
+    .msg-card.deleted { opacity: 0.6; font-style: italic; }
+    .msg-act { background: none; border: 0; padding: 0 2px; font-size: 0.75rem; color: var(--mf-text-dim, #9AA9A6); opacity: 0.55; }
+    .msg-act:hover { opacity: 1; color: var(--mf-accent-bright, #00FFD1); }
+    .channel-item:hover { background: var(--mfc-tint); }
+    .channel-item.active { background: var(--mfc-tint); border-color: var(--mfc-line); }
+    .emoji-btn:hover { background: var(--mfc-tint); }
+    .nav-pills .nav-link { color: var(--mf-accent-bright, #00FFD1); }
+    .nav-pills .nav-link.active { background-color: var(--mf-accent, #00C49F) !important; color: var(--mf-bg, #060B0A) !important; }
+    .badge-role-seller { background: var(--mfc-tint); border-color: var(--mfc-line); }
+    .bg-dark { background-color: var(--mfc-panel-alt) !important; }
+    .border-secondary, .border-secondary-subtle, .border-info-subtle { border-color: var(--mfc-line) !important; }
+    .form-control, .form-select { color: var(--mf-text, #E1EBE8) !important; }
+    .form-control::placeholder { color: var(--mf-text-dim, #9AA9A6); }
+    .btn-outline-secondary, .btn-outline-light { color: var(--mf-text-dim, #9AA9A6) !important; border-color: var(--mfc-line) !important; }
+    .btn-outline-secondary:hover, .btn-outline-light:hover { background: var(--mfc-tint) !important; color: var(--mf-text, #E1EBE8) !important; }
+    .bot-row { display: flex; align-items: center; gap: 8px; font-size: 0.82rem; padding: 2px 4px; }
+    .bot-dot { width: 8px; height: 8px; border-radius: 50%; background: #6c757d; flex-shrink: 0; }
+    .bot-dot.on { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+    .bot-row .form-check-input { cursor: pointer; margin: 0; }
+    .bot-row .form-check-input:checked { background-color: var(--mf-accent, #00C49F); border-color: var(--mf-accent, #00C49F); }
     .text-info { color: var(--mf-accent-bright, #00FFD1) !important; }
-    .border-info, .border-info-subtle { border-color: var(--mf-accent, #00C49F) !important; }
+    .border-info { border-color: var(--mf-accent, #00C49F) !important; }
     .btn-outline-info { color: var(--mf-accent-bright, #00FFD1) !important; border-color: var(--mf-accent, #00C49F) !important; }
     .btn-info { background-color: var(--mf-accent, #00C49F) !important; border-color: var(--mf-accent, #00C49F) !important; color: #030706 !important; }
     .text-light { color: var(--mf-text, #E1EBE8) !important; }
@@ -204,14 +242,20 @@
       <div id="roomList" class="d-flex flex-column gap-1 mb-3 overflow-auto" style="max-height: 36vh;"></div>
 
       <div class="text-uppercase text-secondary font-mono mb-2" style="font-size:0.72rem">Online in Room</div>
-      <div id="onlineList" class="d-flex flex-wrap gap-1 mb-auto"></div>
+      <div id="onlineList" class="d-flex flex-wrap gap-1 mb-3"></div>
 
-      <div class="pt-2 border-top border-secondary-subtle mt-2 d-flex gap-2">
+      <div class="d-flex align-items-center justify-content-between text-uppercase text-secondary font-mono mb-2" style="font-size:0.72rem">
+        <span>AI Bots</span>
+        <span class="badge bg-dark border border-info-subtle font-mono" id="botCount" title="Bots switched on">0/5</span>
+      </div>
+      <div id="botList" class="d-flex flex-column gap-1 mb-auto"></div>
+
+      <div class="pt-2 border-top border-secondary-subtle mt-2 d-flex flex-wrap gap-2">
         <button class="btn btn-sm btn-outline-info flex-grow-1" id="btnTogglePlayer">
           <i class="bi bi-play-btn me-1"></i>Player
         </button>
-        <div class="d-inline-flex align-items-center gap-1 me-1">
-          <select id="mfSchemeSelect" class="form-select form-select-sm bg-dark text-light border-secondary" style="width:auto" title="Pipeline Skin">
+        <div class="d-flex align-items-center gap-1 w-100" style="order:2;min-width:0">
+          <select id="mfSchemeSelect" class="form-select form-select-sm bg-dark text-light border-secondary" style="flex:1 1 0;min-width:0" title="Pipeline Skin">
             <option value="">Default Emerald</option>
             <option value="light-morning">Light Morning</option>
             <option value="cyber-futuristic">Cyber Futuristic</option>
@@ -228,8 +272,8 @@
             <option value="white-black-metallic">White Black Metallic</option>
             <option value="custom">Custom Colors</option>
           </select>
-          <input type="color" id="mfPickBg" value="#060B0A" title="Custom Background" style="width:24px;height:24px;padding:0;border:none;background:none;cursor:pointer" />
-          <input type="color" id="mfPickAccent" value="#00FFD1" title="Custom Accent" style="width:24px;height:24px;padding:0;border:none;background:none;cursor:pointer" />
+          <input type="color" id="mfPickBg" value="#060B0A" title="Custom Background" style="width:24px;height:24px;padding:0;border:none;background:none;cursor:pointer;flex-shrink:0" />
+          <input type="color" id="mfPickAccent" value="#00FFD1" title="Custom Accent" style="width:24px;height:24px;padding:0;border:none;background:none;cursor:pointer;flex-shrink:0" />
         </div>
         <button class="btn btn-sm btn-outline-light" id="btnToggleDrawer" title="Inventory & Giveaways">
           <i class="bi bi-layout-sidebar-reverse"></i>
@@ -412,7 +456,6 @@
       let me = { name: "guest", role: "seller" };
       let activeRoom = "main";
       let roomState = null;
-      let lastId = 0;
       let ws = null;
       let localStream = null;
       let peers = {};
@@ -443,7 +486,12 @@
           throw new Error("unauthorized");
         }
         if (!res.ok) throw new Error(await res.text() || ("HTTP " + res.status));
+        if (res.status === 204) return null;
         return res.json();
+      }
+
+      function esc(v) {
+        return String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
       }
 
       // Emoji picker setup
@@ -502,11 +550,55 @@
         };
       });
 
-      function appendMessage(m) {
-        if (m.id && m.id <= lastId) return;
-        if (m.id) lastId = m.id;
+      const cards = new Map();
+
+      function canModify(m) {
+        return !!m.id && !m.deleted && (m.from === me.name || me.role === "admin");
+      }
+
+      function startEdit(card, m) {
+        const body = card.querySelector(".msg-body");
+        if (!body || card.querySelector(".msg-edit")) return;
+        const inp = document.createElement("input");
+        inp.className = "form-control form-control-sm bg-dark text-light border-secondary msg-edit";
+        inp.value = m.text;
+        inp.title = "Enter to save, Esc to cancel";
+        body.replaceWith(inp);
+        inp.focus();
+        let busy = false;
+        const cancel = () => { if (!busy && inp.isConnected) inp.replaceWith(body); };
+        inp.onblur = cancel;
+        inp.onkeydown = async (e) => {
+          if (e.key === "Escape") return cancel();
+          if (e.key !== "Enter") return;
+          e.preventDefault();
+          const text = inp.value.trim();
+          if (!text || text === m.text) return cancel();
+          busy = true;
+          try {
+            updateMessage(await api("/api/messages", { method: "PUT", headers: hdr(), body: JSON.stringify({ id: m.id, content: text }) }));
+          } catch (err) {
+            busy = false;
+            cancel();
+            alert("Edit failed: " + err.message);
+          }
+        };
+      }
+
+      async function deleteMessage(m) {
+        if (!confirm("Delete this message?")) return;
+        try {
+          await api("/api/messages?id=" + encodeURIComponent(m.id), { method: "DELETE", headers: hdr(false) });
+          markDeleted(m.id);
+        } catch (err) {
+          alert("Delete failed: " + err.message);
+        }
+      }
+
+      function buildCard(m) {
         const card = document.createElement("div");
-        card.className = "msg-card" + (m.from === me.name ? " self" : "");
+        card._msg = m;
+        card.className = "msg-card" + (m.from === me.name ? " self" : "") + (m.deleted ? " deleted" : "");
         const top = document.createElement("div");
         top.className = "d-flex align-items-center gap-2 mb-1";
         const nameEl = document.createElement("span");
@@ -531,12 +623,26 @@
         timeEl.className = "text-secondary font-mono ms-auto";
         timeEl.style.fontSize = "0.68rem";
         timeEl.textContent = m.at ? new Date(m.at).toLocaleTimeString([], { hour12: false }) : "";
+        if (m.edited && !m.deleted) timeEl.textContent += " \u00B7 edited";
         top.appendChild(timeEl);
+        if (canModify(m)) {
+          const act = (icon, title, fn) => {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = "msg-act";
+            b.title = title;
+            b.innerHTML = `<i class="bi ${icon}"></i>`;
+            b.onclick = fn;
+            top.appendChild(b);
+          };
+          if (m.text) act("bi-pencil", "Edit", () => startEdit(card, m));
+          act("bi-trash", "Delete", () => deleteMessage(m));
+        }
         card.appendChild(top);
 
         if (m.text) {
           const body = document.createElement("div");
-          body.className = "small";
+          body.className = "small msg-body";
           body.style.whiteSpace = "pre-wrap";
           body.textContent = m.text;
           card.appendChild(body);
@@ -552,14 +658,80 @@
           const box = document.createElement("div");
           box.className = "mt-2 p-2 rounded border border-info-subtle bg-dark small";
           const linkHtml = (m.pinned_item.url && /^https?:\/\//i.test(m.pinned_item.url))
-            ? `<a href="${m.pinned_item.url}" target="_blank" rel="noopener noreferrer" class="btn btn-xs btn-success py-0 px-2 mt-1">View / Buy <i class="bi bi-box-arrow-up-right ms-1"></i></a>`
+            ? `<a href="${esc(m.pinned_item.url)}" target="_blank" rel="noopener noreferrer" class="btn btn-xs btn-success py-0 px-2 mt-1">View / Buy <i class="bi bi-box-arrow-up-right ms-1"></i></a>`
             : "";
-          box.innerHTML = `<div class="fw-bold text-info"><i class="bi bi-pin-angle-fill me-1"></i>${m.pinned_item.title}</div>
-            <div class="font-mono text-success">$${Number(m.pinned_item.price).toFixed(2)} ? Qty: ${m.pinned_item.quantity}</div>${linkHtml}`;
+          box.innerHTML = `<div class="fw-bold text-info"><i class="bi bi-pin-angle-fill me-1"></i>${esc(m.pinned_item.title)}</div>
+            <div class="font-mono text-success">$${Number(m.pinned_item.price).toFixed(2)} \u00B7 Qty: ${esc(m.pinned_item.quantity)}</div>${linkHtml}`;
           card.appendChild(box);
         }
+        return card;
+      }
+
+      function appendMessage(m) {
+        if (m.id && cards.has(m.id)) return;
+        const card = buildCard(m);
+        if (m.id) cards.set(m.id, card);
         streamEl.appendChild(card);
         streamEl.scrollTop = streamEl.scrollHeight;
+      }
+
+      function updateMessage(m) {
+        const old = m && cards.get(m.id);
+        if (!old) return;
+        const card = buildCard(m);
+        old.replaceWith(card);
+        cards.set(m.id, card);
+      }
+
+      function markDeleted(id) {
+        const old = cards.get(id);
+        if (!old || old._msg.deleted) return;
+        updateMessage({ ...old._msg, deleted: true, text: "This message was deleted", media_url: "", pinned_item: null });
+      }
+
+      function renderBots(list) {
+        const el = document.getElementById("botList");
+        el.innerHTML = "";
+        list = list || [];
+        document.getElementById("botCount").textContent = `${list.filter(b => b.enabled).length}/${list.length}`;
+        list.forEach(b => {
+          const row = document.createElement("div");
+          row.className = "bot-row";
+          row.title = b.active ? `Active \u00B7 ${b.model}` : `Inactive \u00B7 ${b.reason || ""}`;
+          const dot = document.createElement("span");
+          dot.className = "bot-dot" + (b.active ? " on" : "");
+          const name = document.createElement("span");
+          name.className = "fw-semibold";
+          name.textContent = b.mention;
+          const st = document.createElement("span");
+          st.className = "text-secondary font-mono ms-auto";
+          st.style.fontSize = "0.68rem";
+          st.textContent = b.active ? "active" : "inactive";
+          const wrap = document.createElement("span");
+          wrap.className = "form-check form-switch m-0 p-0 d-flex";
+          const sw = document.createElement("input");
+          sw.type = "checkbox";
+          sw.className = "form-check-input";
+          sw.checked = b.enabled;
+          sw.disabled = me.role !== "admin";
+          sw.title = sw.disabled ? "Only admins can switch bots" : (b.enabled ? "Switch off" : "Switch on");
+          sw.onchange = async () => {
+            sw.disabled = true;
+            try {
+              renderBots(await api("/api/bots", { method: "POST", headers: hdr(), body: JSON.stringify({ name: b.name, enabled: sw.checked }) }));
+            } catch (err) {
+              alert("Bot switch failed: " + err.message);
+              loadBots();
+            }
+          };
+          wrap.appendChild(sw);
+          row.append(dot, name, st, wrap);
+          el.appendChild(row);
+        });
+      }
+
+      async function loadBots() {
+        try { renderBots(await api("/api/bots", { headers: hdr(false) })); } catch (err) {}
       }
 
       function applyRoomState(rs) {
@@ -625,7 +797,7 @@
         if (gw.active) {
           banner.classList.remove("d-none");
           banner.classList.add("d-flex");
-          document.getElementById("giveawayBannerText").textContent = `GIVEAWAY: ${gw.title} ? Follow seller for 1 entry!`;
+          document.getElementById("giveawayBannerText").textContent = `GIVEAWAY: ${gw.title} \u00B7 Follow seller for 1 entry!`;
           document.getElementById("giveawayEntryCount").textContent = `${(gw.entries || []).length} entries`;
           document.getElementById("giveawayStatusText").textContent = `Active: ${gw.title} (${(gw.entries || []).length} entries)`;
         } else {
@@ -650,7 +822,7 @@
         list.sort((a, b) => a.id.localeCompare(b.id)).forEach(r => {
           const btn = document.createElement("button");
           btn.className = "channel-item" + (r.id === activeRoom ? " active" : "");
-          btn.innerHTML = `<span>${r.title || r.id}</span><span class="badge bg-dark font-mono">${(r.online || []).length}</span>`;
+          btn.innerHTML = `<span>${esc(r.title || r.id)}</span><span class="badge bg-dark font-mono">${(r.online || []).length}</span>`;
           btn.onclick = () => switchRoom(r.id);
           el.appendChild(btn);
         });
@@ -669,13 +841,13 @@
           card.className = "p-2 rounded glass";
           card.innerHTML = `
             <div class="d-flex justify-content-between align-items-start">
-              <div class="fw-semibold small text-light">${it.title}</div>
+              <div class="fw-semibold small text-light">${esc(it.title)}</div>
               <span class="badge bg-success font-mono">$${Number(it.price).toFixed(2)}</span>
             </div>
-            <div class="text-secondary font-mono mt-1" style="font-size:0.72rem">Qty: ${it.quantity} ? ${it.condition || "NEW"}</div>
+            <div class="text-secondary font-mono mt-1" style="font-size:0.72rem">Qty: ${esc(it.quantity)} \u00B7 ${esc(it.condition || "NEW")}</div>
             <div class="d-flex gap-1 mt-2">
               <button class="btn btn-xs btn-outline-info flex-grow-1 py-0 pin-btn">Pin to Chat</button>
-              ${(it.url && /^https?:\/\//i.test(it.url)) ? `<a href="${it.url}" target="_blank" rel="noopener noreferrer" class="btn btn-xs btn-success py-0 px-2">Buy / Link</a>` : ""}
+              ${(it.url && /^https?:\/\//i.test(it.url)) ? `<a href="${esc(it.url)}" target="_blank" rel="noopener noreferrer" class="btn btn-xs btn-success py-0 px-2">Buy / Link</a>` : ""}
             </div>`;
           card.querySelector(".pin-btn").onclick = async () => {
             await api("/api/messages", {
@@ -697,6 +869,9 @@
         ws.onmessage = (ev) => {
           const msg = JSON.parse(ev.data);
           if (msg.type === "chat") appendMessage(msg.data);
+          if (msg.type === "msg_edit") updateMessage(msg.data);
+          if (msg.type === "msg_delete") markDeleted(msg.data.id);
+          if (msg.type === "bots") renderBots(msg.data);
           if (msg.type === "room_state") applyRoomState(msg.data);
           if (msg.type === "rtc_signal") handleRTCSignal(msg.from, msg.data);
         };
@@ -704,7 +879,7 @@
 
       async function switchRoom(roomId) {
         activeRoom = roomId;
-        lastId = 0;
+        cards.clear();
         streamEl.innerHTML = "";
         stopMic();
         await loadRooms();
@@ -962,8 +1137,10 @@
         const rb = document.getElementById("selfRoleBadge");
         rb.textContent = me.role;
         rb.className = "badge font-mono " + (me.role === "admin" ? "badge-role-admin" : "badge-role-seller");
+        loadBots();
         await switchRoom(activeRoom);
       }
+      setInterval(() => { if (apiKey) loadBots(); }, 30000);
 
       if (!apiKey) authModal.show();
       else boot().catch(() => {});

@@ -292,16 +292,38 @@ func saveAllMsgsLocked() {
 if store == nil {
 return
 }
-f, err := os.Create(msgsFile)
+// Rewrite the same file that is loaded at startup, atomically, then reopen
+// the append handle so later posts land in the new file.
+tmp := msgsFile + ".tmp"
+f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 if err != nil {
+log.Printf("save messages: %v", err)
 return
 }
+bw := bufio.NewWriter(f)
 for _, m := range msgs {
 b, _ := json.Marshal(m)
-f.Write(b)
-f.Write([]byte("\n"))
+bw.Write(b)
+bw.WriteByte('\n')
+}
+if err := bw.Flush(); err != nil {
+f.Close()
+os.Remove(tmp)
+log.Printf("save messages: %v", err)
+return
 }
 f.Close()
+if err := os.Rename(tmp, msgsFile); err != nil {
+os.Remove(tmp)
+log.Printf("save messages: %v", err)
+return
+}
+if nf, err := os.OpenFile(msgsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); err == nil {
+store.Close()
+store = nf
+} else {
+log.Printf("reopen messages: %v", err)
+}
 }
 
 func handleAiMentionsLocked(roomID string, userMsg *Msg) {
@@ -331,6 +353,13 @@ func handleAiMentionsLocked(roomID string, userMsg *Msg) {
         }
     }
 }
+func msgRoom(room string) string {
+	if room == "" {
+		return "main"
+	}
+	return room
+}
+
 func apiMessages(w http.ResponseWriter, r *http.Request) {
 	u, ok := who(r)
 	if !ok {
@@ -339,12 +368,12 @@ func apiMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	switch r.Method {
-case "PUT":
+case "PUT", "PATCH":
 var req struct {
 ID      int64  `json:"id"`
 Content string `json:"content"`
 }
-if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768)).Decode(&req); err != nil || strings.TrimSpace(req.Content) == "" {
 http.Error(w, "bad request", 400)
 return
 }
@@ -357,6 +386,11 @@ mu.Unlock()
 http.Error(w, "forbidden", 403)
 return
 }
+if msgs[i].Deleted {
+mu.Unlock()
+http.Error(w, "message was deleted", 409)
+return
+}
 msgs[i].Text = req.Content
 msgs[i].Edited = true
 updated = &msgs[i]
@@ -365,7 +399,7 @@ break
 }
 if updated != nil {
 saveAllMsgsLocked()
-broadcastRoomLocked(updated.Room, "msg_edit", updated)
+broadcastRoomLocked(msgRoom(updated.Room), "msg_edit", updated)
 }
 mu.Unlock()
 if updated == nil {
@@ -389,13 +423,14 @@ return
 }
 msgs[i].Deleted = true
 msgs[i].Text = "This message was deleted"
+msgs[i].MediaURL, msgs[i].MediaType, msgs[i].PinnedItem = "", "", nil
 deleted = &msgs[i]
 break
 }
 }
 if deleted != nil {
 saveAllMsgsLocked()
-broadcastRoomLocked(deleted.Room, "msg_delete", map[string]any{"id": deleted.ID, "room": deleted.Room})
+broadcastRoomLocked(msgRoom(deleted.Room), "msg_delete", map[string]any{"id": deleted.ID, "room": deleted.Room})
 }
 mu.Unlock()
 if deleted == nil {
@@ -468,6 +503,7 @@ case "GET":
 		lastID = m.ID
 		broadcastRoomLocked(in.Room, "chat", m)
 		mu.Unlock()
+		triggerAIMentions(in.Room, u.Name, in.Text)
 		json.NewEncoder(w).Encode(m)
 	default:
 		http.Error(w, "method not allowed", 405)
@@ -1192,28 +1228,166 @@ w.Header().Set("Content-Type", "application/json")
 json.NewEncoder(w).Encode(snap)
 }
 
-func triggerAIMentions(room, fromUser, text string) {
-bots := []struct {
+type aiBot struct {
 Mention string
 Name    string
 Model   string
 Persona string
-}{
+}
+
+var (
+aiBots = []aiBot{
 {"@cyra", "cyra", "qwen2.5:7b", "You are Cyra, a sharp and friendly MateFlow AI co-host. Keep replies concise (1-3 sentences)."},
 {"@muse", "muse", "qwen3:30b", "You are Muse, a creative MateFlow AI stylist & curator. Keep replies concise (1-3 sentences)."},
 {"@openclaw", "openclaw", "qwen2.5:7b", "You are OpenClaw, a fast technical MateFlow AI ops agent. Keep replies concise (1-3 sentences)."},
 {"@hermes", "hermes", "qwen3:30b-a3b", "You are Hermes, a MateFlow commerce & auction messenger AI. Keep replies concise (1-3 sentences)."},
 {"@grok", "grok", "grok-3-latest:latest", "You are Grok, a witty and direct MateFlow AI assistant. Keep replies concise (1-3 sentences)."},
 }
+ollamaURL = "http://127.0.0.1:11434"
+botsFile  = "/var/lib/mf-chat/bots.json"
+botOff    = map[string]bool{} // guarded by mu
+
+ollamaMu     sync.Mutex
+ollamaModels map[string]bool
+ollamaAt     time.Time
+)
+
+func loadBots() {
+if b, err := os.ReadFile(botsFile); err == nil {
+json.Unmarshal(b, &botOff)
+}
+}
+
+// ollamaInstalled lists the models Ollama has, cached for 15s; nil means Ollama is unreachable.
+func ollamaInstalled() map[string]bool {
+ollamaMu.Lock()
+defer ollamaMu.Unlock()
+if time.Since(ollamaAt) < 15*time.Second {
+return ollamaModels
+}
+ollamaAt = time.Now()
+ollamaModels = nil
+client := &http.Client{Timeout: 3 * time.Second}
+resp, err := client.Get(ollamaURL + "/api/tags")
+if err != nil {
+return nil
+}
+defer resp.Body.Close()
+var out struct {
+Models []struct {
+Name string `json:"name"`
+} `json:"models"`
+}
+if resp.StatusCode != 200 || json.NewDecoder(resp.Body).Decode(&out) != nil {
+return nil
+}
+ollamaModels = map[string]bool{}
+for _, m := range out.Models {
+ollamaModels[m.Name] = true
+ollamaModels[strings.TrimSuffix(m.Name, ":latest")] = true
+}
+return ollamaModels
+}
+
+type botStatus struct {
+Name    string `json:"name"`
+Mention string `json:"mention"`
+Model   string `json:"model"`
+Enabled bool   `json:"enabled"`
+Active  bool   `json:"active"`
+Reason  string `json:"reason,omitempty"`
+}
+
+func botStatuses() []botStatus {
+installed := ollamaInstalled()
+mu.Lock()
+defer mu.Unlock()
+out := make([]botStatus, 0, len(aiBots))
+for _, b := range aiBots {
+s := botStatus{Name: b.Name, Mention: b.Mention, Model: b.Model, Enabled: !botOff[b.Name]}
+switch {
+case !s.Enabled:
+s.Reason = "switched off"
+case installed == nil:
+s.Reason = "Ollama unreachable"
+case !installed[b.Model] && !installed[strings.TrimSuffix(b.Model, ":latest")]:
+s.Reason = "model " + b.Model + " not installed"
+default:
+s.Active = true
+}
+out = append(out, s)
+}
+return out
+}
+
+func apiBots(w http.ResponseWriter, r *http.Request) {
+u, ok := who(r)
+if !ok {
+http.Error(w, "unauthorized", 401)
+return
+}
+switch r.Method {
+case "GET":
+case "POST":
+if u.Role != "admin" {
+http.Error(w, "forbidden: admin only", 403)
+return
+}
+var in struct {
+Name    string `json:"name"`
+Enabled bool   `json:"enabled"`
+}
+if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&in); err != nil {
+http.Error(w, "bad request", 400)
+return
+}
+known := false
+for _, b := range aiBots {
+known = known || b.Name == in.Name
+}
+if !known {
+http.Error(w, "unknown bot", 404)
+return
+}
+mu.Lock()
+if in.Enabled {
+delete(botOff, in.Name)
+} else {
+botOff[in.Name] = true
+}
+b, _ := json.Marshal(botOff)
+if err := os.WriteFile(botsFile, b, 0600); err != nil {
+log.Printf("save bots: %v", err)
+}
+mu.Unlock()
+default:
+http.Error(w, "method not allowed", 405)
+return
+}
+list := botStatuses()
+if r.Method == "POST" {
+env, _ := json.Marshal(map[string]any{"type": "bots", "data": list})
+mu.Lock()
+for c := range clients {
+select {
+case c.send <- env:
+default:
+}
+}
+mu.Unlock()
+}
+w.Header().Set("Content-Type", "application/json")
+json.NewEncoder(w).Encode(list)
+}
+
+func triggerAIMentions(room, fromUser, text string) {
 low := strings.ToLower(text)
-for _, b := range bots {
-if strings.Contains(low, b.Mention) {
-go func(bot struct {
-Mention string
-Name    string
-Model   string
-Persona string
-}) {
+for _, b := range aiBots {
+mu.Lock()
+off := botOff[b.Name]
+mu.Unlock()
+if !off && strings.Contains(low, b.Mention) {
+go func(bot aiBot) {
 payload := map[string]any{
 "model":  bot.Model,
 "stream": false,
@@ -1224,7 +1398,7 @@ payload := map[string]any{
 }
 jb, _ := json.Marshal(payload)
 client := &http.Client{Timeout: 45 * time.Second}
-resp, err := client.Post("http://127.0.0.1:11434/api/chat", "application/json", bytes.NewReader(jb))
+resp, err := client.Post(ollamaURL+"/api/chat", "application/json", bytes.NewReader(jb))
 reply := ""
 if err == nil {
 defer resp.Body.Close()
@@ -1238,7 +1412,8 @@ reply = strings.TrimSpace(out.Message.Content)
 }
 }
 if reply == "" {
-reply = "[" + bot.Name + " online ? ask me anything!]"
+log.Printf("bot %s (%s): no reply from Ollama (err=%v)", bot.Name, bot.Model, err)
+reply = "[" + bot.Name + " could not reply: model " + bot.Model + " did not answer]"
 }
 mu.Lock()
 m := Msg{
@@ -1262,6 +1437,12 @@ mu.Unlock()
 func main() {
 	mrand.Seed(time.Now().UnixNano())
 	addr, keyPath, data := os.Getenv("MFCHAT_ADDR"), os.Getenv("MFCHAT_KEYS"), os.Getenv("MFCHAT_DATA")
+	msgsFile = data
+	botsFile = filepath.Join(filepath.Dir(data), "bots.json")
+	if v := os.Getenv("MFCHAT_OLLAMA"); v != "" {
+		ollamaURL = strings.TrimRight(v, "/")
+	}
+	loadBots()
 	loadKeys(keyPath)
 	initRooms()
 
@@ -1285,6 +1466,7 @@ func main() {
 
 	http.HandleFunc("/api/me", apiMe)
 	http.HandleFunc("/api/messages", apiMessages)
+	http.HandleFunc("/api/bots", apiBots)
 	http.HandleFunc("/api/rooms", apiRooms)
 	http.HandleFunc("/api/rooms/store", apiRoomStore)
 	http.HandleFunc("/api/rooms/state", apiRoomState)
